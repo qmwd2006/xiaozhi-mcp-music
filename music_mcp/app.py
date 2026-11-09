@@ -84,6 +84,24 @@ async def _search_song(args: dict) -> dict:
     return _tool_result([summary, text], {"songs": payload})
 
 
+def _search_query(query: str) -> str:
+    """把口语化查询清洗成音源友好的关键词组合。
+
+    例：
+      '播放单依纯的有趣' -> '单依纯 有趣'
+      '我想听周杰伦的稻香' -> '周杰伦 稻香'
+      '来一首青花瓷' -> '青花瓷'
+    音源（尤其酷我）对整句口语的检索效果很差，会返回大量无关结果。
+    """
+    text = query or ""
+    for filler in _FILLER_WORDS:
+        text = text.replace(filler, " ")
+    parts = re.split(r"[\s的,，、/|·:：]+", text)
+    tokens = [p.strip() for p in parts if len(_normalize(p)) >= 1]
+    cleaned = " ".join(tokens).strip()
+    return cleaned or query
+
+
 async def _resolve_candidates(query: str, song_id: str, source: Optional[str]) -> List[Song]:
     """根据参数构造候选歌曲列表。"""
     if song_id and source:
@@ -97,7 +115,10 @@ async def _resolve_candidates(query: str, song_id: str, source: Optional[str]) -
                 artist="",
             )
         ]
-    songs = await manager.search(query, limit=12, source=source)
+    search_text = _search_query(query)
+    if search_text != query:
+        logger.info("搜索词清洗: %r -> %r", query, search_text)
+    songs = await manager.search(search_text, limit=12, source=source)
     if song_id:
         matched = [s for s in songs if s.song_id == song_id]
         if matched:
@@ -133,6 +154,7 @@ _NOISE_KEYWORDS = (
     "竹笛", "二胡", "古筝", "琵琶", "笛箫", "钢琴版", "吉他版",
     "改编", "变奏", "翻自", "cover", "r&b", "rb版", "1.0x", "1.1x", "1.2x",
     "抖音", "热播", "女声版", "男声版", "童声", "ai翻唱", "ai孙燕姿",
+    "直拍", "现场版", "音高测量", "乐评", "reaction视频", "夺冠", "首唱",
 )
 
 
