@@ -57,10 +57,13 @@
 - “换一首别的歌”：`play_song` 新歌 → `self.music.play_url`（立即替换当前曲目）。
 - “这首歌听腻了，放下一首”：直接 `self.music.next`，不必重新搜索。
 - “刚才那首再放一遍”：`self.music.prev`。
+- “把曲库里的歌挨个放一遍”：`library_list` → 逐首 `enqueue_url`。
+- “再放一次刚才那首”（曲库已有）：`library_search` 拿本地地址 → `play_url`。
 
 ### 本地曲库
 
-播放过的歌曲会自动保存到本地曲库，之后可离线重播。相关工具：
+播放过的歌曲会自动保存到本地曲库（`LIBRARY_DIR`），之后**离线也能播**，
+不需要重新搜索或联网。曲库文件不会过期，B站视频下架也不影响。
 
 | 用户说法 | 调用 |
 |---|---|
@@ -70,8 +73,10 @@
 | 清空曲库 / 删掉所有本地歌曲 | `library_clear` |
 | 曲库占多大 / 存了多少首 | `library_stats` |
 
-曲库搜索返回的 `play_url` 同样是本地流地址，拿到后按单曲流程调用
-`self.music.play_url` 即可播放。
+**优先走曲库**：用户点某首歌时，如果曲库里已经有，直接用 `library_search`
+拿本地 `play_url` 播放，比重新联网搜索更快、更稳。
+曲库搜索返回的 `play_url` 是本地流地址，拿到后按单曲流程调用
+`self.music.play_url`（单首）或 `self.music.enqueue_url`（连播）即可。
 
 **注意**：`library_clear` 会删除全部本地音频，只在用户明确要求清空时调用，
 不要擅自清空。
@@ -101,8 +106,8 @@
    set_repeat / stop / status`，由 `qmwd2006/xiaozhi-esp32` 的
    `build-audio-board-music` workflow 产出。
 4. `play_url` 是「立即播放」（会清空队列），`enqueue_url` 是「加入播放列表」。
-   连播请用 enqueue_url。
+   连播必须用 enqueue_url，用错会导致只剩最后一首。
 5. 本地曲库保存在 `LIBRARY_DIR`（默认 `./library`），播放过的歌会自动入库，
-   可用 `library_*` 工具语音管理。
+   离线可播，可用 `library_*` 工具语音管理。
 6. 若模型仍只回复“正在播放”而不调用设备工具，强化提示词措辞，
    或换用指令遵循更强的模型。

@@ -388,7 +388,8 @@ async def _play_song(args: dict) -> dict:
 async def _play_playlist(args: dict) -> dict:
     """解析多首歌曲的播放直链，供设备端连播。
 
-    设备端 self.music.play_url 支持入队：模型按返回顺序依次调用即可连播。
+    模型应按返回顺序逐首调用 self.music.enqueue_url（入队，不打断当前曲目）。
+    不要用 self.music.play_url——那是「立即播放」语义，会清空队列。
     """
     query = str(args.get("query", "") or "").strip()
     limit = int(args.get("limit", 5) or 5)
@@ -694,7 +695,8 @@ def build_server() -> MCPServer:
             "批量搜索并返回多首歌曲的播放直链，用于连续播放（连播）。"
             "用户说“播放某歌手的歌”“来几首xx”“播放歌单”时使用。"
             "返回结果含 songs 数组，每项有 play_url；"
-            "请按顺序逐首调用设备工具 self.music.play_url（它会自动入队连播）。"
+            "请按顺序逐首调用设备工具 self.music.enqueue_url 加入播放队列"
+            "（不要用 self.music.play_url，那是立即播放并清空队列）。"
         ),
         {
             "type": "object",
