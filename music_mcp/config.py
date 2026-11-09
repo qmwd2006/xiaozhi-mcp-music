@@ -81,6 +81,10 @@ class Settings:
     stream_public_host: str = (
         os.getenv("STREAM_PUBLIC_HOST", "").strip() or _detect_lan_ip()
     )
+    # 本地曲库目录：持久保存已转码音频，独立于临时缓存，可长期重播
+    library_dir: Path = Path(
+        os.getenv("LIBRARY_DIR", str(PROJECT_ROOT / "library"))
+    )
 
 
 settings = Settings()

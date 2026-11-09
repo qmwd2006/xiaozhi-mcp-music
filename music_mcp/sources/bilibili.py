@@ -253,14 +253,30 @@ class BilibiliSource(MusicSource):
         验证/首次读取会失败并被误判为「不可播放」。
         """
         from music_mcp import stream_server
+        from music_mcp.library import library
+
+        # 曲库命中：直接复用持久文件，无需联网与转码。
+        if library.has_file(song.song_id):
+            library.mark_played(song.song_id)
+            return PlayResult(
+                url=stream_server.build_library_url(song.song_id),
+                mime_type="audio/mpeg",
+                note="本地曲库",
+                extra_source_url=library.get(song.song_id).get("source_url", ""),
+            )
 
         source_url = await self.get_audio_source_url(song.song_id)
-        # 预热：完成转码落盘，保证本地流立即可读。
-        await stream_server.ensure_cached(song.song_id, source_url)
-        local_url = stream_server.build_stream_url(song.song_id)
+        # 转码并保存到曲库（持久化，后续可离线重播）。
+        await stream_server._transcode_and_store(
+            song.song_id,
+            source_url,
+            title=song.title,
+            artist=song.artist,
+            duration=song.duration,
+        )
         return PlayResult(
-            url=local_url,
+            url=stream_server.build_library_url(song.song_id),
             mime_type="audio/mpeg",
-            note="哔哩哔哩(本地转码)",
+            note="哔哩哔哩(已存入曲库)",
             extra_source_url=source_url,
         )

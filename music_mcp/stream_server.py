@@ -24,6 +24,7 @@ from typing import Optional
 from aiohttp import web
 
 from music_mcp.config import settings
+from music_mcp.library import library
 
 logger = logging.getLogger("music_mcp.stream_server")
 
@@ -42,10 +43,17 @@ def _cache_dir() -> Path:
 
 
 def build_stream_url(bvid: str) -> str:
-    """构造设备可访问的转码流地址。"""
+    """构造设备可访问的转码流地址（临时转码）。"""
     host = settings.stream_public_host
     port = _started_port or settings.stream_port
     return f"http://{host}:{port}/stream/bili/{bvid}.mp3"
+
+
+def build_library_url(bvid: str) -> str:
+    """构造设备可访问的曲库播放地址（持久文件，优先使用）。"""
+    host = settings.stream_public_host
+    port = _started_port or settings.stream_port
+    return f"http://{host}:{port}/library/{bvid}.mp3"
 
 
 async def _get_bili_audio_url(bvid: str) -> str:
@@ -59,10 +67,23 @@ async def _get_bili_audio_url(bvid: str) -> str:
 
 
 async def _transcode_to_cache(bvid: str, upstream: str) -> Path:
-    """把上游音频转成单声道 24kHz MP3 落盘，返回文件路径。"""
+    """把上游音频转成单声道 24kHz MP3 落盘，返回文件路径。
+
+    若曲库中已有该曲，直接复用曲库文件（并同步到临时缓存目录）。
+    """
     target = _cache_dir() / f"{bvid}.mp3"
     if target.exists() and target.stat().st_size > 0:
         return target
+
+    # 曲库优先：已下载过的歌曲无需再次转码。
+    lib_file = library.file_path(bvid)
+    if lib_file.exists() and lib_file.stat().st_size > 0:
+        try:
+            shutil.copy2(lib_file, target)
+            logger.info("复用曲库文件 %s", lib_file.name)
+            return target
+        except Exception as exc:
+            logger.warning("复用曲库文件失败 %s: %s", lib_file, exc)
 
     tmp_fd, tmp_name = tempfile.mkstemp(suffix=".mp3", dir=str(_cache_dir()))
     os.close(tmp_fd)
@@ -93,6 +114,23 @@ async def _transcode_to_cache(bvid: str, upstream: str) -> Path:
     tmp_path.replace(target)
     logger.info("转码完成 %s (%d bytes)", bvid, target.stat().st_size)
     return target
+
+
+async def _transcode_and_store(
+    bvid: str, upstream: str, title: str = "", artist: str = "", duration: int = 0
+) -> Path:
+    """转码并保存到曲库（持久化），返回曲库文件路径。"""
+    target = _cache_dir() / f"{bvid}.mp3"
+    if not (target.exists() and target.stat().st_size > 0):
+        await _transcode_to_cache(bvid, upstream)
+    # 复制到曲库目录
+    lib_path = library.file_path(bvid)
+    if not (lib_path.exists() and lib_path.stat().st_size > 0):
+        lib_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(target, lib_path)
+    library.add(bvid, title=title, artist=artist, duration=duration,
+                source_url=upstream)
+    return lib_path
 
 
 async def _stream_file(request: web.Request, path: Path) -> web.StreamResponse:
@@ -152,6 +190,11 @@ async def ensure_cached(bvid: str, upstream: str) -> Path:
 async def _handle_bili(request: web.Request) -> web.StreamResponse:
     bvid = request.match_info["bvid"]
     try:
+        # 曲库优先：已保存的歌曲直接播放，不重新转码。
+        lib_path = library.file_path(bvid)
+        if lib_path.exists() and lib_path.stat().st_size > 0:
+            library.mark_played(bvid)
+            return await _stream_file(request, lib_path)
         cached = _cache_dir() / f"{bvid}.mp3"
         if cached.exists() and cached.stat().st_size > 0:
             return await _stream_file(request, cached)
@@ -163,6 +206,16 @@ async def _handle_bili(request: web.Request) -> web.StreamResponse:
         return web.Response(status=502, text=f"stream failed: {exc}")
 
 
+async def _handle_library(request: web.Request) -> web.StreamResponse:
+    """提供曲库中的持久音频文件。"""
+    bvid = request.match_info["bvid"]
+    path = library.file_path(bvid)
+    if not (path.exists() and path.stat().st_size > 0):
+        return web.Response(status=404, text="not in library")
+    library.mark_played(bvid)
+    return await _stream_file(request, path)
+
+
 async def _handle_health(request: web.Request) -> web.Response:
     return web.json_response({"ok": True, "port": _started_port})
 
@@ -170,6 +223,7 @@ async def _handle_health(request: web.Request) -> web.Response:
 def build_app() -> web.Application:
     app = web.Application()
     app.router.add_get("/stream/bili/{bvid}.mp3", _handle_bili)
+    app.router.add_get("/library/{bvid}.mp3", _handle_library)
     app.router.add_get("/health", _handle_health)
     return app
 

@@ -13,6 +13,8 @@ from music_mcp.models import Song
 from music_mcp.resource_proxy import proxy
 from music_mcp.sources import manager
 from music_mcp.utils import compact_json, truncate_text
+from music_mcp import stream_server
+from music_mcp.library import library
 
 logger = logging.getLogger("music_mcp.app")
 
@@ -525,6 +527,95 @@ async def _list_sources(args: dict) -> dict:
     return _tool_result([f"可用音源 {len(payload)} 个：\n" + text], {"sources": payload})
 
 
+def _library_item_public(item: dict) -> dict:
+    return {
+        "bvid": item.get("bvid", ""),
+        "title": item.get("title", ""),
+        "artist": item.get("artist", ""),
+        "duration": item.get("duration", 0),
+        "size_mb": round(int(item.get("size") or 0) / 1024 / 1024, 1),
+        "play_count": item.get("play_count", 0),
+        "play_url": stream_server.build_library_url(item.get("bvid", "")),
+    }
+
+
+async def _library_list(args: dict) -> dict:
+    limit = int(args.get("limit", 20) or 20)
+    limit = max(1, min(limit, 100))
+    items = library.list(limit=limit)
+    stats = library.stats()
+    if not items:
+        return _tool_result(
+            ["曲库还是空的。播放过的歌曲会自动保存到曲库，之后可离线重播。"],
+            {"count": 0, "songs": [], **stats},
+        )
+    payload = [_library_item_public(i) for i in items]
+    lines = [f"曲库共 {stats['count']} 首，占用 {stats['total_mb']} MB。最近保存的 {len(payload)} 首："]
+    for i, it in enumerate(payload, 1):
+        lines.append(f"{i}. {it['title']} - {it['artist']}")
+        lines.append(f"   url={it['play_url']}")
+    text = compact_json({"count": len(payload), "songs": payload})
+    return _tool_result(["\n".join(lines), text], {"count": stats["count"], "songs": payload, **stats})
+
+
+async def _library_search(args: dict) -> dict:
+    query = str(args.get("query", "") or "").strip()
+    if not query:
+        return _tool_result(["请提供查询关键词，例如：单依纯。"], {"songs": []}, is_error=True)
+    items = library.search(query, limit=20)
+    if not items:
+        return _tool_result(
+            [f"曲库里没有与「{query}」匹配的歌曲。"], {"songs": []}
+        )
+    payload = [_library_item_public(i) for i in items]
+    lines = [f"曲库中找到 {len(payload)} 首与「{query}」相关的歌曲："]
+    for i, it in enumerate(payload, 1):
+        lines.append(f"{i}. {it['title']} - {it['artist']}")
+        lines.append(f"   url={it['play_url']}")
+    text = compact_json({"count": len(payload), "songs": payload})
+    return _tool_result(["\n".join(lines), text], {"songs": payload})
+
+
+async def _library_delete(args: dict) -> dict:
+    bvid = str(args.get("bvid", "") or "").strip()
+    query = str(args.get("query", "") or "").strip()
+    if not bvid and not query:
+        return _tool_result(
+            ["需要 bvid 或 query 才能删除。"], {"deleted": 0}, is_error=True
+        )
+    if bvid:
+        ok = library.remove(bvid)
+        return _tool_result(
+            ["已从曲库删除。" if ok else "曲库里没有这首歌。"],
+            {"deleted": 1 if ok else 0},
+            is_error=not ok,
+        )
+    # 按关键词删除所有匹配项
+    items = library.search(query, limit=100)
+    if not items:
+        return _tool_result([f"曲库里没有与「{query}」匹配的歌曲。"], {"deleted": 0})
+    deleted = 0
+    for it in items:
+        if library.remove(it["bvid"]):
+            deleted += 1
+    return _tool_result(
+        [f"已从曲库删除 {deleted} 首与「{query}」匹配的歌曲。"], {"deleted": deleted}
+    )
+
+
+async def _library_clear(args: dict) -> dict:
+    count = library.clear()
+    return _tool_result([f"曲库已清空，共删除 {count} 首。"], {"deleted": count})
+
+
+async def _library_stats(args: dict) -> dict:
+    stats = library.stats()
+    return _tool_result(
+        [f"曲库共 {stats['count']} 首，占用 {stats['total_mb']} MB（{stats['dir']}）。"],
+        stats,
+    )
+
+
 async def _local_player_control(args: dict) -> dict:
     action = str(args.get("action", "status") or "status").strip()
     if action == "play":
@@ -645,6 +736,68 @@ def build_server() -> MCPServer:
             },
         },
         _get_play_url,
+    )
+
+    server.add_tool(
+        "library_list",
+        (
+            "列出本地曲库中已保存的歌曲。播放过的歌曲会自动保存到曲库，"
+            "之后可离线重播。返回每首歌的 play_url，可直接交给设备播放。"
+        ),
+        {
+            "type": "object",
+            "properties": {
+                "limit": {"type": "integer", "minimum": 1, "maximum": 100,
+                          "description": "返回数量，默认 20"},
+            },
+        },
+        _library_list,
+    )
+
+    server.add_tool(
+        "library_search",
+        (
+            "在本地曲库中按歌名/歌手搜索已保存的歌曲，返回 play_url。"
+            "用户说“放曲库里的xx”“本地有没有xx”时使用。"
+        ),
+        {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "歌名或歌手关键词"},
+            },
+            "required": ["query"],
+        },
+        _library_search,
+    )
+
+    server.add_tool(
+        "library_delete",
+        (
+            "从本地曲库删除歌曲（会同时删除音频文件）。"
+            "用户说“删掉xx”“把这首从曲库去掉”时使用。"
+        ),
+        {
+            "type": "object",
+            "properties": {
+                "bvid": {"type": "string", "description": "精确指定曲目 ID（优先）"},
+                "query": {"type": "string", "description": "按关键词批量删除"},
+            },
+        },
+        _library_delete,
+    )
+
+    server.add_tool(
+        "library_clear",
+        "清空整个本地曲库。用户明确说“清空曲库/删除所有本地歌曲”时才使用。",
+        {"type": "object", "properties": {}},
+        _library_clear,
+    )
+
+    server.add_tool(
+        "library_stats",
+        "查看本地曲库的歌曲数量与占用空间。",
+        {"type": "object", "properties": {}},
+        _library_stats,
     )
 
     server.add_tool(

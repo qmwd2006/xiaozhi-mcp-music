@@ -107,6 +107,11 @@ $env:SMOKE_QUERY="青花瓷"; python scripts/mcp_smoke.py   # 协议冒烟测试
 | `search_song` | 在全部/指定音源搜索歌曲 | `query`（歌名/歌手）、`source`、`limit` |
 | `play_song` | 搜索并播放；返回文本 + ResourceLink 音频资源 | `query`、`song_id`、`source` |
 | `get_play_url` | 只解析播放直链，不播放 | `query`、`song_id`、`source` |
+| `library_list` | 列出本地曲库已保存歌曲 | `limit` |
+| `library_search` | 在本地曲库搜索（离线可用） | `query` |
+| `library_delete` | 从曲库删除（含文件） | `bvid`、`query` |
+| `library_clear` | 清空曲库 | 无 |
+| `library_stats` | 曲库数量与占用空间 | 无 |
 | `list_sources` | 查看可用音源与健康状态 | 无 |
 | `local_player_control` | 电脑本地播放器控制（可选） | `action`、`url` |
 
@@ -128,6 +133,17 @@ $env:SMOKE_QUERY="青花瓷"; python scripts/mcp_smoke.py   # 协议冒烟测试
 
 > 使用 B站音源需要：本机安装 `ffmpeg`；设备能访问 `STREAM_PUBLIC_HOST:STREAM_PORT`
 > （同一局域网，或做端口映射）。
+
+### 本地曲库
+
+B 站音频转码后会**持久保存**到 `LIBRARY_DIR`（默认 `./library`），并写入
+`index.json` 元数据索引（标题/歌手/时长/大小/播放次数）。特点：
+
+- 独立于临时缓存，不会被自动清理，可长期保留；
+- 再次播放同一首歌时直接读本地文件，**无需联网、无需重新转码**；
+- 可通过语音管理：`library_list` 查看、`library_search` 搜索、
+  `library_delete` 删除、`library_clear` 清空、`library_stats` 查看占用；
+- 曲库音频通过内置流服务 `/library/{bvid}.mp3` 提供给设备（支持 Range）。
 
 接口方案参考 LX Music / MusicFree 等开源社区项目，可能随时间变化；
 服务器会在播放失败时自动尝试下一候选歌曲/音源。
