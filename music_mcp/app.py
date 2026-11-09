@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any, Dict, List, Optional
 
 from music_mcp.config import settings
@@ -118,15 +119,159 @@ _MIN_FULL_DURATION = 60
 # 超过此长度基本是歌单/合集/循环串烧，不是单曲（秒，15 分钟）。
 _MAX_SONG_DURATION = 15 * 60
 
+# 查询里的口语填充词，切词前先去掉，避免影响相关性判断。
+_FILLER_WORDS = (
+    "我想听", "想听", "帮我", "给我", "请", "播放", "来一首", "来首",
+    "放一首", "放首", "一首", "歌曲", "的歌", "歌", "音乐", "听听",
+)
+# 明显不是单曲的标题关键词（B 站视频标题尤其常见）。
+_NOISE_KEYWORDS = (
+    "琴谱", "光遇", "教程", "教学", "讲解", "指弹", "吉他谱", "钢琴课",
+    "鼓谱", "谱", "vlog", "巡演", "演唱会", "音乐节", "现场直拍", "饭拍",
+    "reaction", "翻唱合集", "合集", "串烧", "歌单", "循环", "纯音乐",
+    "伴奏", "dj版", "remix", "0.8x", "加速版", "慢速版",
+    "竹笛", "二胡", "古筝", "琵琶", "笛箫", "钢琴版", "吉他版",
+    "改编", "变奏", "翻自", "cover", "r&b", "rb版", "1.0x", "1.1x", "1.2x",
+    "抖音", "热播", "女声版", "男声版", "童声", "ai翻唱", "ai孙燕姿",
+)
 
-def _candidate_rank(song: Song) -> tuple:
-    """候选排序：可疑（片段/超长合集）靠后 -> 音源优先级 -> 时长（长者优先）。"""
-    prio = _SOURCE_PRIORITY.get(song.source, 99)
+
+def _normalize(text: str) -> str:
+    """归一化：转小写并去掉标点、空白与装饰性符号，仅保留字母/数字/汉字。"""
+    text = (text or "").lower()
+    return re.sub(r"[^0-9a-z\u4e00-\u9fff]+", "", text)
+
+
+def _query_terms(query: str) -> tuple:
+    """把用户查询解析为 (关键词列表, 去填充词后的整串)。
+
+    例：'播放单依纯的永不失联的爱' -> (['单依纯', '永不失联'], '单依纯永不失联的爱')
+    """
+    text = query or ""
+    for filler in _FILLER_WORDS:
+        text = text.replace(filler, " ")
+    parts = re.split(r"[\s的,，、/|·:：]+", text)
+    tokens: List[str] = []
+    for part in parts:
+        token = _normalize(part)
+        if len(token) >= 2 and token not in tokens:
+            tokens.append(token)
+    whole = _normalize(text)
+    return tokens, whole
+
+
+def _relevance(song: Song, tokens: List[str], whole: str) -> float:
+    """候选与查询的匹配度（0~1）。
+
+    评分由两部分组成：
+    - 完整查询串是否出现在标题/歌手中（强信号，权重 0.6）
+    - 各关键词的命中率（弱信号，权重 0.4）
+    """
+    if not tokens:
+        return 0.5
+    title = _normalize(song.title)
+    artist = _normalize(song.artist)
+    haystack = f"{title}{artist}"
+    if not haystack:
+        return 0.0
+
+    token_hits = sum(1 for token in tokens if token in haystack) / len(tokens)
+    whole_hit = 1.0 if whole and whole in haystack else 0.0
+    # 标题里直接包含完整查询串是最强信号
+    title_hit = 1.0 if whole and whole in title else 0.0
+    return 0.4 * token_hits + 0.4 * whole_hit + 0.2 * title_hit
+
+
+def _artist_match(song: Song, tokens: List[str]) -> int:
+    """查询中的关键词是否指向演唱者。
+
+    - 结构化音源（酷我/网易云/酷狗）：artist 字段是真实歌手。
+    - B 站：artist 是 UP 主，真正歌手通常写在标题里（如「周杰伦《稻香》」），
+      因此标题命中同样计入。
+    """
+    artist = _normalize(song.artist)
+    title = _normalize(song.title)
+    for token in tokens:
+        if len(token) < 2:
+            continue
+        if token in artist or token in title:
+            return 1
+    return 0
+
+
+def _artist_count(song: Song) -> int:
+    """歌手字段里的人数（按常见分隔符估算）。"""
+    raw = song.artist or ""
+    parts = re.split(r"[&、,，/]|feat\.?|ft\.?", raw)
+    return max(1, len([p for p in parts if p.strip()]))
+
+
+def _is_noisy_title(song: Song) -> bool:
+    """标题是否命中「非单曲」关键词。"""
+    title = (song.title or "").lower()
+    return any(word in title for word in _NOISE_KEYWORDS)
+
+
+def _artist_exact(song: Song, artist_query: str) -> int:
+    """歌手字段是否精确包含查询的歌手名（用于纯歌手查询）。"""
+    if not artist_query:
+        return 0
+    return 1 if artist_query in _normalize(song.artist) else 0
+
+
+def _detect_artist_query(tokens: List[str], candidates: List[Song]) -> str:
+    """判断查询词是否更像「歌手名」。
+
+    思路：如果某个关键词在多数候选的 artist 字段里出现，而较少出现在
+    标题里，那用户多半是在点歌手（如「单依纯」）；反之是歌名（如「稻香」）。
+    """
+    if len(tokens) != 1 or not candidates:
+        return ""
+    token = tokens[0]
+    if len(token) < 2:
+        return ""
+
+    artist_hits = 0
+    title_hits = 0
+    for song in candidates:
+        if token in _normalize(song.artist):
+            artist_hits += 1
+        if token in _normalize(song.title):
+            title_hits += 1
+
+    total = len(candidates)
+    # 至少 1/3 的候选歌手字段命中，且明显多于标题命中，才认定为歌手查询。
+    if artist_hits >= max(2, total // 3) and artist_hits > title_hits:
+        return token
+    return ""
+
+
+def _candidate_rank(song: Song, tokens: List[str], whole: str, artist_query: str = "") -> tuple:
+    """候选排序。
+
+    优先级：匹配度（高者优先）-> 歌手命中 -> 独唱优先（合唱降权）
+    -> 可疑度（片段/超长/非单曲标题）-> 音源可靠度 -> 时长（长者优先）。
+
+    artist_query 非空时表示这是「纯歌手查询」（如「单依纯」），
+    此时歌手字段精确命中远比标题提到更重要。
+    """
+    relevance = _relevance(song, tokens, whole)
+    artist_hit = _artist_match(song, tokens)
+    # 多人合唱通常不是用户想点的「某歌手的歌」，排在同歌手独唱之后。
+    chorus = 1 if _artist_count(song) > 1 else 0
     suspicious = 0
-    if song.duration:
-        if song.duration < _MIN_FULL_DURATION or song.duration > _MAX_SONG_DURATION:
-            suspicious = 1
-    return (suspicious, prio, -song.duration)
+    if song.duration and (
+        song.duration < _MIN_FULL_DURATION or song.duration > _MAX_SONG_DURATION
+    ):
+        suspicious = 1
+    if _is_noisy_title(song):
+        suspicious += 1
+    prio = _SOURCE_PRIORITY.get(song.source, 99)
+    if artist_query:
+        # 纯歌手查询：歌手字段命中 > 标题命中 > 其它
+        exact = _artist_exact(song, artist_query)
+        return (-exact, -artist_hit, chorus, suspicious, prio, -song.duration)
+    return (-relevance, -artist_hit, chorus, suspicious, prio, -song.duration)
 
 
 async def _play_song(args: dict) -> dict:
@@ -148,8 +293,12 @@ async def _play_song(args: dict) -> dict:
         logger.exception("搜索歌曲失败")
         return _tool_result([f"搜索失败: {exc}"], {"playing": False}, is_error=True)
 
-    # 按音源可靠度与完整度排序，优先尝试能提供完整曲的候选。
-    candidates = sorted(candidates, key=_candidate_rank)
+    # 按「查询匹配度 -> 完整度 -> 音源可靠度」排序，优先尝试真正的目标歌曲。
+    tokens, whole = _query_terms(query)
+    artist_query = "" if song_id else _detect_artist_query(tokens, candidates)
+    candidates = sorted(
+        candidates, key=lambda s: _candidate_rank(s, tokens, whole, artist_query)
+    )
 
     if not candidates:
         return _tool_result(

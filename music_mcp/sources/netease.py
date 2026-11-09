@@ -94,8 +94,20 @@ class NeteaseSource(MusicSource):
         if resp.status_code in (301, 302, 303, 307, 308):
             location = resp.headers.get("location") or resp.headers.get("Location")
             if location:
+                # 不可用歌曲会被重定向到 /404，这不是可播放地址。
+                if location.rstrip("/").endswith("/404"):
+                    raise SourceError("网易云该歌曲不可用（重定向到 404）")
                 return PlayResult(url=location, mime_type="audio/mpeg", note="网易云外链")
-        if resp.status_code == 200 and resp.content:
-            # 部分接口直接返回音频内容或最终地址
-            return PlayResult(url=outer_url, mime_type="audio/mpeg", note="网易云外链")
+            raise SourceError("网易云外链重定向缺少地址")
+
+        if resp.status_code == 200:
+            # 外链接口已不稳定：歌曲不可用时返回 200 + HTML 错误页，
+            # 必须按内容类型判断，避免把 HTML 当成音频地址。
+            content_type = (resp.headers.get("content-type") or "").lower()
+            if "text/html" in content_type:
+                raise SourceError("网易云外链不可用（返回 HTML 页面）")
+            if content_type.startswith("audio/") or resp.content[:3] in (b"ID3", b"\xff\xfb", b"\xff\xf3"):
+                return PlayResult(url=outer_url, mime_type="audio/mpeg", note="网易云外链")
+            raise SourceError("网易云外链返回了非音频内容")
+
         raise SourceError("网易云该歌曲不可用（可能为 VIP/下架）")

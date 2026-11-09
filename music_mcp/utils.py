@@ -54,10 +54,12 @@ def sanitize_filename(name: str, max_len: int = 80) -> str:
 
 
 def clean_text(text: str) -> str:
-    """清理接口返回文本中的 BOM、零宽字符与多余空白。"""
+    """清理接口返回文本中的 BOM、零宽字符、HTML 高亮标签与多余空白。"""
     if not isinstance(text, str):
         text = str(text or "")
     text = text.replace("\ufeff", "").replace("\u200b", "").replace("\u200e", "").replace("\u200f", "")
+    # 酷狗等接口会用 <em> 高亮搜索关键词，需去掉标签本身。
+    text = re.sub(r"</?em>", "", text)
     return re.sub(r"\s+", " ", text).strip()
 
 
