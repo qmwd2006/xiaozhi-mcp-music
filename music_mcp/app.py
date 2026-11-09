@@ -104,6 +104,31 @@ async def _resolve_candidates(query: str, song_id: str, source: Optional[str]) -
     return songs
 
 
+# 音源优先级：能提供完整曲的音源排前面。
+# 酷我等平台对部分热门歌曲只返回试听片段，B站通常有完整音轨。
+_SOURCE_PRIORITY = {
+    "bilibili": 0,
+    "netease": 1,
+    "kuwo": 2,
+    "kugou": 3,
+    "migu": 4,
+}
+# 明显是片段/试听的最短时长（秒）；低于此值排到后面。
+_MIN_FULL_DURATION = 60
+# 超过此长度基本是歌单/合集/循环串烧，不是单曲（秒，15 分钟）。
+_MAX_SONG_DURATION = 15 * 60
+
+
+def _candidate_rank(song: Song) -> tuple:
+    """候选排序：可疑（片段/超长合集）靠后 -> 音源优先级 -> 时长（长者优先）。"""
+    prio = _SOURCE_PRIORITY.get(song.source, 99)
+    suspicious = 0
+    if song.duration:
+        if song.duration < _MIN_FULL_DURATION or song.duration > _MAX_SONG_DURATION:
+            suspicious = 1
+    return (suspicious, prio, -song.duration)
+
+
 async def _play_song(args: dict) -> dict:
     query = str(args.get("query", "") or "").strip()
     song_id = str(args.get("song_id", "") or "").strip()
@@ -122,6 +147,9 @@ async def _play_song(args: dict) -> dict:
     except Exception as exc:
         logger.exception("搜索歌曲失败")
         return _tool_result([f"搜索失败: {exc}"], {"playing": False}, is_error=True)
+
+    # 按音源可靠度与完整度排序，优先尝试能提供完整曲的候选。
+    candidates = sorted(candidates, key=_candidate_rank)
 
     if not candidates:
         return _tool_result(
@@ -153,6 +181,7 @@ async def _play_song(args: dict) -> dict:
                         "title": song.title,
                         "artist": song.artist,
                         "source": song.source_name,
+                        "play_url": play.url,
                         "message": f"正在播放：{song.title} - {song.artist}",
                     }
                 )

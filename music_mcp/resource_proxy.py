@@ -105,12 +105,18 @@ class ResourceProxy:
         return base64.b64encode(data).decode("ascii")
 
     async def verify_url(self, url: str) -> bool:
-        """轻量验证播放地址是否可访问。"""
+        """轻量验证播放地址是否可访问（并确认返回的是音频而非 HTML 错误页）。"""
         if not (url.startswith("http://") or url.startswith("https://")):
             return False
         try:
             resp = await self._client.get(url, headers={"Range": "bytes=0-1"})
-            return resp.status_code in (200, 206)
+            if resp.status_code not in (200, 206):
+                return False
+            content_type = (resp.headers.get("content-type") or "").lower()
+            # 网易云外链失效时会返回 200 + HTML 404 页，必须排除。
+            if "text/html" in content_type:
+                return False
+            return True
         except Exception:
             return False
 
