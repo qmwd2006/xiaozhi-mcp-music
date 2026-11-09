@@ -54,3 +54,6 @@ class PlayResult:
     mime_type: str = "audio/mpeg"
     bitrate: int = 0
     note: str = ""
+    # 某些音源（如 B 站）需要服务端二次转码：这里保存上游原始音频地址，
+    # 供内置 stream_server 拉流转码使用。
+    extra_source_url: str = ""

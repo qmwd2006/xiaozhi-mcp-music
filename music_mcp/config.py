@@ -34,6 +34,25 @@ def _int(name: str, default: int) -> int:
         return default
 
 
+def _detect_lan_ip() -> str:
+    """探测本机局域网 IP，供设备访问内置流服务使用。"""
+    import socket
+
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            # 不会真正发包，仅用于让内核选择出口网卡
+            s.connect(("8.8.8.8", 80))
+            return s.getsockname()[0]
+        finally:
+            s.close()
+    except Exception:
+        try:
+            return socket.gethostbyname(socket.gethostname())
+        except Exception:
+            return "127.0.0.1"
+
+
 @dataclass
 class Settings:
     enabled_sources: List[str] = field(
@@ -56,6 +75,12 @@ class Settings:
     custom_api_base: Optional[str] = os.getenv("CUSTOM_API_BASE") or None
     cache_dir: Path = Path(os.getenv("CACHE_DIR", str(PROJECT_ROOT / "cache")))
     log_level: str = os.getenv("LOG_LEVEL", "INFO").strip().upper()
+    # 内置音频流服务（供 B站等需要服务端转码的音源使用）
+    stream_port: int = _int("STREAM_PORT", 8099)
+    # 设备访问本机流服务使用的主机地址（需是设备能访问到的局域网 IP）
+    stream_public_host: str = (
+        os.getenv("STREAM_PUBLIC_HOST", "").strip() or _detect_lan_ip()
+    )
 
 
 settings = Settings()

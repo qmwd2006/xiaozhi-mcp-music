@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from typing import Dict, List, Optional
@@ -14,6 +15,7 @@ from .kuwo import KuwoSource
 from .netease import NeteaseSource
 from .migu import MiguSource
 from .kugou import KugouSource
+from .bilibili import BilibiliSource
 
 logger = logging.getLogger("music_mcp.sources")
 
@@ -24,6 +26,7 @@ def _source_classes() -> Dict[str, type]:
         "netease": NeteaseSource,
         "migu": MiguSource,
         "kugou": KugouSource,
+        "bilibili": BilibiliSource,
     }
 
 
@@ -57,19 +60,47 @@ class SourceManager:
         limit: int = 8,
         source: Optional[str] = None,
     ) -> List[Song]:
-        """在指定或全部音源中搜索，结果按 音源->相关度 顺序返回。"""
+        """在指定或全部音源中搜索。
+
+        多音源时先给每个音源保底分配名额，避免排序靠后的音源（如 B 站）
+        因前面的音源占满 limit 而完全丢失；剩余名额再按轮转补齐。
+        """
         if not query.strip():
             return []
         names = [source] if source and source in self.sources else self.names
-        per_source = max(1, (limit + len(names) - 1) // len(names))
-        results: List[Song] = []
-        for name in names:
+        if not names:
+            return []
+
+        # 每个音源至少尝试 2 条，最多不超过 limit，保证覆盖度。
+        per_source = max(2, (limit + len(names) - 1) // len(names))
+        per_source = min(per_source, limit)
+
+        # 并发查询各音源，避免串行等待拖慢整体响应。
+        async def _one(name: str) -> List[Song]:
             try:
-                songs = await self.sources[name].search(query, limit=per_source)
-                results.extend(songs)
+                return await self.sources[name].search(query, limit=per_source)
             except Exception as exc:
                 logger.warning("音源 %s 搜索失败: %s", name, exc)
-        return results[:limit]
+                return []
+
+        batches = await asyncio.gather(*(_one(n) for n in names))
+
+        # 轮转合并：每轮从各音源各取一条，保证结果分布均衡。
+        results: List[Song] = []
+        seen: set = set()
+        max_len = max((len(b) for b in batches), default=0)
+        for i in range(max_len):
+            for batch in batches:
+                if i < len(batch):
+                    song = batch[i]
+                    key = (song.source, song.song_id)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    results.append(song)
+                    if len(results) >= limit:
+                        return results
+        return results
 
     async def resolve(self, song: Song) -> PlayResult:
         src = self.sources.get(song.source)
