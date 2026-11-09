@@ -105,20 +105,42 @@ class ResourceProxy:
         return base64.b64encode(data).decode("ascii")
 
     async def verify_url(self, url: str) -> bool:
-        """轻量验证播放地址是否可访问（并确认返回的是音频而非 HTML 错误页）。"""
+        """轻量验证播放地址是否可访问（并确认返回的是音频而非 HTML 错误页）。
+
+        注意：不能盲目跟随重定向。网易云外链对不可用歌曲会 302 到
+        `music.163.com/404`，跟随之后会得到一个 200 的 HTML 页面。
+        这里对重定向只检查 Location 目标，不实际跟随。
+        """
         if not (url.startswith("http://") or url.startswith("https://")):
             return False
         try:
             resp = await self._client.get(url, headers={"Range": "bytes=0-1"})
-            if resp.status_code not in (200, 206):
-                return False
-            content_type = (resp.headers.get("content-type") or "").lower()
-            # 网易云外链失效时会返回 200 + HTML 404 页，必须排除。
-            if "text/html" in content_type:
-                return False
-            return True
+            if resp.status_code in (301, 302, 303, 307, 308):
+                location = resp.headers.get("location") or resp.headers.get("Location") or ""
+                if not location or location.rstrip("/").endswith("/404"):
+                    return False
+                # 重定向目标是真实音频地址时，再轻量校验一次。
+                return await self._verify_audio_url(location)
+            return self._is_audio_response(resp)
         except Exception:
             return False
+
+    async def _verify_audio_url(self, url: str) -> bool:
+        try:
+            resp = await self._client.get(url, headers={"Range": "bytes=0-1"})
+        except Exception:
+            return False
+        return self._is_audio_response(resp)
+
+    @staticmethod
+    def _is_audio_response(resp: "httpx.Response") -> bool:
+        if resp.status_code not in (200, 206):
+            return False
+        content_type = (resp.headers.get("content-type") or "").lower()
+        # HTML 错误页（如网易云 404）不是音频。
+        if "text/html" in content_type:
+            return False
+        return True
 
 
 proxy = ResourceProxy()

@@ -155,6 +155,7 @@ _NOISE_KEYWORDS = (
     "改编", "变奏", "翻自", "cover", "r&b", "rb版", "1.0x", "1.1x", "1.2x",
     "抖音", "热播", "女声版", "男声版", "童声", "ai翻唱", "ai孙燕姿",
     "直拍", "现场版", "音高测量", "乐评", "reaction视频", "夺冠", "首唱",
+    "ktv", "伴奏版", "纯伴奏", "消音", "和声版",
 )
 
 
@@ -262,8 +263,10 @@ def _detect_artist_query(tokens: List[str], candidates: List[Song]) -> str:
             title_hits += 1
 
     total = len(candidates)
-    # 至少 1/3 的候选歌手字段命中，且明显多于标题命中，才认定为歌手查询。
-    if artist_hits >= max(2, total // 3) and artist_hits > title_hits:
+    # 判定依据：查询词是否作为「演唱者」出现在候选的 artist 字段。
+    # 只有 artist 命中达到 2 条才认定为歌手查询；
+    # 标题命中再多也不算——歌名查询的标题必然都含歌名。
+    if artist_hits >= 2:
         return token
     return ""
 
@@ -380,6 +383,111 @@ async def _play_song(args: dict) -> dict:
     )
 
 
+async def _play_playlist(args: dict) -> dict:
+    """解析多首歌曲的播放直链，供设备端连播。
+
+    设备端 self.music.play_url 支持入队：模型按返回顺序依次调用即可连播。
+    """
+    query = str(args.get("query", "") or "").strip()
+    limit = int(args.get("limit", 5) or 5)
+    limit = max(1, min(limit, 10))
+    source_raw = str(args.get("source", "auto") or "auto").strip()
+    source = source_raw if source_raw in manager.names else None
+
+    if not query:
+        return _tool_result(
+            ["请提供搜索关键词 query，例如：周杰伦 或 单依纯 的歌。"],
+            {"playing": False, "songs": []},
+            is_error=True,
+        )
+
+    try:
+        # 连播需要更多候选，扩大搜索量后再筛选。
+        search_text = _search_query(query)
+        candidates = await manager.search(search_text, limit=max(40, limit * 8), source=source)
+    except Exception as exc:
+        logger.exception("搜索歌曲失败")
+        return _tool_result([f"搜索失败: {exc}"], {"playing": False}, is_error=True)
+
+    tokens, whole = _query_terms(query)
+    artist_query = _detect_artist_query(tokens, candidates)
+    candidates = sorted(
+        candidates, key=lambda s: _candidate_rank(s, tokens, whole, artist_query)
+    )
+
+    # 连播时更严格：优先「歌手字段命中 + 独唱 + 非噪声标题」，
+    # 过滤 UP 主视频、合唱、伴奏/KTV/翻唱等。
+    if artist_query:
+        strict = [
+            s for s in candidates
+            if _artist_exact(s, artist_query)
+            and _artist_count(s) <= 1
+            and not _is_noisy_title(s)
+        ]
+        if len(strict) >= limit:
+            candidates = strict
+        else:
+            # 不够时放宽标题限制，但仍排除合唱与非目标歌手。
+            relaxed = [
+                s for s in candidates
+                if _artist_exact(s, artist_query) and _artist_count(s) <= 1
+            ]
+            if len(relaxed) >= limit:
+                candidates = relaxed
+
+    # 去重：同一首歌可能在多个音源出现，按「歌名+歌手」归一化后只保留首个。
+    picked: List[dict] = []
+    seen_titles: set = set()
+    verify = settings.local_player == "none"
+    for song in candidates:
+        if len(picked) >= limit:
+            break
+        key = (_normalize(song.title), _normalize(song.artist.split("/")[0]))
+        if key in seen_titles:
+            continue
+        try:
+            play = await manager.resolve(song)
+            if not play.url:
+                continue
+            if verify and not await _verify_url(play.url):
+                continue
+        except Exception as exc:
+            logger.debug("连播解析失败 %s: %s", song.title, exc)
+            continue
+        seen_titles.add(key)
+        picked.append(
+            {
+                "title": song.title,
+                "artist": song.artist,
+                "source": song.source_name,
+                "duration": song.duration,
+                "play_url": play.url,
+                "mime_type": play.mime_type,
+            }
+        )
+
+    if not picked:
+        return _tool_result(
+            [f"没有找到「{query}」可播放的歌曲，请换个关键词。"],
+            {"playing": False, "songs": []},
+        )
+
+    # 文本里直接给出「序号. 歌名 - 歌手 -> url」，
+    # 强调 url 必须原样复制，避免模型自行拼接/臆造地址。
+    lines = [
+        f"已找到 {len(picked)} 首可播放歌曲。",
+        "请按顺序逐首调用 self.music.play_url，url 参数必须原样复制下面的地址，"
+        "不要改写、不要拼接、不要使用其他域名：",
+    ]
+    for i, item in enumerate(picked, 1):
+        lines.append(f"{i}. {item['title']} - {item['artist']}")
+        lines.append(f"   url={item['play_url']}")
+    summary = "\n".join(lines)
+
+    urls_text = compact_json({"count": len(picked), "songs": picked})
+    return _tool_result([summary, urls_text], {"playing": False, "songs": picked})
+
+
 async def _get_play_url(args: dict) -> dict:
     query = str(args.get("query", "") or "").strip()
     song_id = str(args.get("song_id", "") or "").strip()
@@ -487,6 +595,35 @@ def build_server() -> MCPServer:
             },
         },
         _play_song,
+    )
+
+    server.add_tool(
+        "play_playlist",
+        (
+            "批量搜索并返回多首歌曲的播放直链，用于连续播放（连播）。"
+            "用户说“播放某歌手的歌”“来几首xx”“播放歌单”时使用。"
+            "返回结果含 songs 数组，每项有 play_url；"
+            "请按顺序逐首调用设备工具 self.music.play_url（它会自动入队连播）。"
+        ),
+        {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "歌手名、歌名或关键词，例如：单依纯"},
+                "limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 10,
+                    "description": "返回歌曲数量，默认 5",
+                },
+                "source": {
+                    "type": "string",
+                    "enum": SOURCE_CHOICES,
+                    "description": "指定音源；auto 表示自动选择",
+                },
+            },
+            "required": ["query"],
+        },
+        _play_playlist,
     )
 
     server.add_tool(

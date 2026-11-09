@@ -30,12 +30,88 @@ _SEARCH_URL = "https://api.bilibili.com/x/web-interface/wbi/search/type"
 _VIEW_URL = "https://api.bilibili.com/x/web-interface/view"
 _PLAYURL_URL = "https://api.bilibili.com/x/player/playurl"
 
-# 只保留可能包含完整歌曲的视频标题特征
-_MUSIC_HINTS = ("音乐", "歌曲", "无损", "音质", "hi-res", "hires", "mv", "官方", "音频")
+# 明显不是歌曲视频的标题关键词（B 站音乐区之外的内容常混入）。
+_NON_SONG_KEYWORDS = (
+    "vlog", "路透", "机场", "出发", "抵达", "快闪", "活动", "花絮", "幕后",
+    "采访", "访谈", "综艺", "reaction", "直播回放", "演唱会", "巡演",
+    "教学", "教程", "讲解", "指弹", "吉他谱", "钢琴课", "琴谱", "光遇",
+    "reaction", "街拍", "生图", "颜值", "混剪", "盘点", "合集",
+)
 
 
 def _strip_tags(text: str) -> str:
     return re.sub(r"<[^>]+>", "", html.unescape(text or "")).strip()
+
+
+# 提取歌手时要去掉的修饰词（按长度降序匹配）。
+_ARTIST_NOISE = (
+    "百万豪装录音棚大声听", "百万录音棚", "录音棚", "无损音质", "无损", "音质",
+    "新歌", "官方", "完整版", "纯享", "高清", "超清", "修复", "现场", "live",
+    "翻唱", "cover", "mv", "hi-res", "hires", "4k", "8k", "1080p", "重制",
+    "全mv", "全曲", "纯妹妹", "经典", "精选", "合集",
+)
+# 「歌手《歌名》」：歌手在书名号之前，最多 12 个字符。
+_ARTIST_BEFORE_BOOK_TITLE = re.compile(
+    r"([\u4e00-\u9fffA-Za-z0-9·&、]{2,12})\s*[《【]"
+)
+# 「《歌名》- 歌手」：书名号之后紧跟歌手名。
+_ARTIST_AFTER_BOOK_TITLE = re.compile(
+    r"[》】]\s*[-—–·]\s*([\u4e00-\u9fffA-Za-z0-9·&、]{2,12})"
+)
+
+
+def _extract_artist_from_title(title: str) -> str:
+    """尽量从 B 站标题里提取真实歌手名。
+
+    B 站搜索结果的 author 是 UP 主，不是歌手；真实歌手通常写在标题里，
+    形如「单依纯《有趣》」「【4K修复】林志炫《烟花易冷》」。
+    提取失败时返回空串。
+    """
+    text = _strip_tags(title)
+    # 先去掉「不含书名号」的方括号块（【4K修复】/【纯享】等），
+    # 保留含《》的块，因为「【单依纯《有趣》】」里歌手就在其中。
+    text = re.sub(r"[【\[][^】\]《]*[】\]]", " ", text)
+    for m in _ARTIST_BEFORE_BOOK_TITLE.finditer(text):
+        candidate = m.group(1).strip()
+        # 去掉修饰词（可能是前缀也可能是后缀）
+        changed = True
+        while changed:
+            changed = False
+            low = candidate.lower()
+            for noise in _ARTIST_NOISE:
+                if low.endswith(noise) and len(candidate) > len(noise):
+                    candidate = candidate[: -len(noise)].strip()
+                    changed = True
+                    low = candidate.lower()
+                elif low.startswith(noise) and len(candidate) > len(noise):
+                    candidate = candidate[len(noise):].strip()
+                    changed = True
+                    low = candidate.lower()
+        if _looks_like_artist(candidate):
+            return candidate
+    # 退而求其次：「《歌名》- 歌手」形式。
+    for m in _ARTIST_AFTER_BOOK_TITLE.finditer(text):
+        candidate = m.group(1).strip()
+        if _looks_like_artist(candidate):
+            return candidate
+    return ""
+
+
+def _looks_like_artist(candidate: str) -> bool:
+    """过滤明显是描述性短语而非歌手名的候选。"""
+    if not (2 <= len(candidate) <= 10):
+        return False
+    low = candidate.lower()
+    # 含描述性词汇的一律排除（这类通常是标题里的修饰语）。
+    for bad in ("老师", "解析", "声乐", "合集", "精选", "全mv", "音乐", "现场",
+                "合唱", "翻唱", "改编", "教程", "教学", "节目", "综艺",
+                "录音棚", "豪装", "大声听", "听", "看", "超", "最", "版"):
+        if bad in low:
+            return False
+    # 真实歌手名很少含标点或超过 10 字；含数字/符号的多为描述。
+    if re.search(r"[0-9０-９]", candidate):
+        return False
+    return True
 
 
 def _parse_duration(text: str) -> int:
@@ -72,10 +148,14 @@ class BilibiliSource(MusicSource):
         )
 
     async def search(self, query: str, limit: int = 10) -> List[Song]:
+        # tids=3 限定「音乐」分区，order=click 按播放量排序，
+        # 能显著减少 vlog/路透/快闪等无关内容。
         params = {
             "search_type": "video",
             "keyword": query,
             "page": "1",
+            "tids": "3",
+            "order": "click",
         }
         try:
             resp = await self._client.get(_SEARCH_URL, params=params)
@@ -96,28 +176,28 @@ class BilibiliSource(MusicSource):
             title = _strip_tags(str(item.get("title") or ""))
             if not bvid or not title:
                 continue
-            # 过滤明显不是完整歌曲的（教程/讲解/翻唱合集等仍需靠标题判断，这里只做粗筛）
-            lower = title.lower()
-            if not any(h in lower for h in _MUSIC_HINTS) and "翻唱" not in title:
-                # 仍然保留，但排在后面；这里简单跳过纯教程类
-                if any(k in title for k in ("教学", "教程", "讲解", "指弹", "吉他谱", "钢琴课")):
-                    continue
             duration = _parse_duration(str(item.get("duration") or ""))
             if duration and duration < 45:
                 # 太短的基本是切片/片段，不是完整歌曲
                 continue
+            # 跳过明显不是歌曲的内容（vlog、路透、活动、教程等）。
+            if any(k in title for k in _NON_SONG_KEYWORDS):
+                continue
             author = _strip_tags(str(item.get("author") or ""))
+            # 优先用标题里提取的真实歌手；失败才退回 UP 主名。
+            artist = _extract_artist_from_title(title) or clean_text(author) or "未知"
             songs.append(
                 Song(
                     source=self.name,
                     source_name=self.display_name,
                     song_id=bvid,
                     title=clean_text(title),
-                    artist=clean_text(author) or "未知",
+                    artist=clean_text(artist),
                     album="",
                     duration=duration,
                     cover_url=str(item.get("pic") or "").replace("http://", "https://"),
                     mime_type="audio/mpeg",
+                    extra={"uploader": clean_text(author)},
                 )
             )
             if len(songs) >= limit:
