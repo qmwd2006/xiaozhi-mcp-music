@@ -248,6 +248,9 @@ _NOISE_KEYWORDS = (
     "抖音", "热播", "女声版", "男声版", "童声", "ai翻唱", "ai孙燕姿",
     "直拍", "现场版", "音高测量", "乐评", "reaction视频", "夺冠", "首唱",
     "ktv", "伴奏版", "纯伴奏", "消音", "和声版",
+    "解析", "声乐老师", "乐感课", "对比", "盘点", "混剪", "纯享版",
+    "听力", "测试", "挑战", "盲听", "排名", "抄袭", "又双叒叕", "摊上事",
+    "热搜", "争议", "回应", "道歉", "爆料", "八卦",
 )
 
 
@@ -335,32 +338,36 @@ def _artist_exact(song: Song, artist_query: str) -> int:
 
 
 def _detect_artist_query(tokens: List[str], candidates: List[Song]) -> str:
-    """判断查询词是否更像「歌手名」。
+    """判断查询中的哪个词是「歌手名」。
 
-    思路：如果某个关键词在多数候选的 artist 字段里出现，而较少出现在
-    标题里，那用户多半是在点歌手（如「单依纯」）；反之是歌名（如「稻香」）。
+    思路：候选的 artist 字段是音源返回的真实演唱者。若某个查询词在
+    artist 字段中出现 ≥2 次，就认为它是歌手名。
+
+    同时支持多词查询（如「林志炫的烟花易冷」）：此时歌名 token 只会
+    在标题里出现，而歌手 token 会出现在 artist 字段里，据此区分。
     """
-    if len(tokens) != 1 or not candidates:
+    if not candidates:
         return ""
-    token = tokens[0]
-    if len(token) < 2:
+    stats: List[tuple] = []
+    for token in tokens:
+        if len(token) < 2:
+            continue
+        artist_hits = sum(
+            1 for song in candidates if token in _normalize(song.artist)
+        )
+        stats.append((artist_hits, token))
+    if not stats:
         return ""
-
-    artist_hits = 0
-    title_hits = 0
-    for song in candidates:
-        if token in _normalize(song.artist):
-            artist_hits += 1
-        if token in _normalize(song.title):
-            title_hits += 1
-
-    total = len(candidates)
-    # 判定依据：查询词是否作为「演唱者」出现在候选的 artist 字段。
-    # 只有 artist 命中达到 2 条才认定为歌手查询；
-    # 标题命中再多也不算——歌名查询的标题必然都含歌名。
-    if artist_hits >= 2:
-        return token
-    return ""
+    stats.sort(reverse=True)
+    best_hits, best_token = stats[0]
+    if best_hits < 2:
+        return ""
+    # 多个词都命中 artist 时（B 站 artist 常写成标题片段），
+    # 只有第一名明显领先才认定，避免把歌名误判成歌手名。
+    if len(stats) > 1 and stats[1][0] == best_hits:
+        # 平手时优先较短、且不是整句的子串（歌手名通常更短）
+        return min((best_token, stats[1][1]), key=len)
+    return best_token
 
 
 def _candidate_rank(song: Song, tokens: List[str], whole: str, artist_query: str = "") -> tuple:
@@ -381,14 +388,21 @@ def _candidate_rank(song: Song, tokens: List[str], whole: str, artist_query: str
         song.duration < _MIN_FULL_DURATION or song.duration > _MAX_SONG_DURATION
     ):
         suspicious = 1
+    # 常见歌曲长度 90~480 秒；明显偏离的（超长访谈/合集）额外降权
+    if song.duration and not (90 <= song.duration <= 480):
+        suspicious += 1
     if _is_noisy_title(song):
         suspicious += 1
-    prio = _SOURCE_PRIORITY.get(song.source, 99)
+    # 本地曲库（已下载、可离线播放）优先于在线音源。
+    if song.source_name == "本地曲库":
+        prio = -1
+    else:
+        prio = _SOURCE_PRIORITY.get(song.source, 99)
     if artist_query:
         # 纯歌手查询：歌手字段命中 > 标题命中 > 其它
         exact = _artist_exact(song, artist_query)
-        return (-exact, -artist_hit, chorus, suspicious, prio, -song.duration)
-    return (-relevance, -artist_hit, chorus, suspicious, prio, -song.duration)
+        return (-exact, -artist_hit, suspicious, chorus, prio, -song.duration)
+    return (-relevance, -artist_hit, suspicious, chorus, prio, -song.duration)
 
 
 async def _play_song(args: dict) -> dict:
