@@ -104,6 +104,72 @@ def _search_query(query: str) -> str:
     return cleaned or query
 
 
+def _library_candidates(query: str, limit: int = 5) -> List[Song]:
+    """在本地曲库中查找候选（同音字容错）。
+
+    曲库文件是本地持久音频，命中即可离线播放，且不受音源风控影响。
+    """
+    try:
+        items = library.search(query, limit=limit)
+    except Exception as exc:
+        logger.debug("曲库查询失败: %s", exc)
+        return []
+    songs: List[Song] = []
+    for item in items:
+        bvid = item.get("bvid") or ""
+        if not bvid or not library.has_file(bvid):
+            continue
+        songs.append(
+            Song(
+                source="bilibili",
+                source_name="本地曲库",
+                song_id=bvid,
+                title=item.get("title") or bvid,
+                artist=item.get("artist") or "",
+                duration=int(item.get("duration") or 0),
+                mime_type="audio/mpeg",
+            )
+        )
+    return songs
+
+
+# 常见同音字替换表（针对语音识别高频错字）。
+_HOMOPHONE_HINTS = {
+    "朱": ["珠", "竹", "主"],
+    "珠": ["朱", "竹"],
+    "竹": ["朱", "珠"],
+    "青": ["清", "轻"],
+    "清": ["青", "轻"],
+    "晴": ["青", "情"],
+    "情": ["晴", "青"],
+    "依": ["一", "衣", "伊"],
+    "易": ["意", "亦", "亿"],
+    "冷": ["铃", "玲"],
+    "花": ["华", "画"],
+    "华": ["花", "画"],
+    "夜": ["叶", "业"],
+    "叶": ["夜", "业"],
+}
+
+
+def _pinyin_variants(query: str, max_variants: int = 4) -> List[str]:
+    """生成同音字替换后的查询变体，用于音源检索兜底。
+
+    只替换查询中的单个汉字，且限制数量，避免请求量爆炸。
+    """
+    variants: List[str] = []
+    seen: set = set()
+    for idx, ch in enumerate(query):
+        for repl in _HOMOPHONE_HINTS.get(ch, ()):
+            candidate = query[:idx] + repl + query[idx + 1:]
+            if candidate != query and candidate not in seen:
+                seen.add(candidate)
+                variants.append(candidate)
+                if len(variants) >= max_variants:
+                    return variants
+    return variants
+
+
 async def _resolve_candidates(query: str, song_id: str, source: Optional[str]) -> List[Song]:
     """根据参数构造候选歌曲列表。"""
     if song_id and source:
@@ -120,11 +186,35 @@ async def _resolve_candidates(query: str, song_id: str, source: Optional[str]) -
     search_text = _search_query(query)
     if search_text != query:
         logger.info("搜索词清洗: %r -> %r", query, search_text)
+
+    # 先查本地曲库（同音字容错、不受音源风控影响）。
+    local: List[Song] = []
+    if not song_id:
+        local = _library_candidates(search_text, limit=5)
+        if local:
+            logger.info("曲库命中 %d 首，优先使用", len(local))
+
     songs = await manager.search(search_text, limit=12, source=source)
+
+    # 音源无结果时，退回复用曲库结果（常见于 ASR 同音字错、或音源限流）。
+    if not songs and not song_id:
+        if local:
+            return local
+        # 逐字替换同音字重试（例如「朱玉」->「珠玉」）
+        for variant in _pinyin_variants(search_text):
+            logger.info("同音字重试: %r", variant)
+            songs = await manager.search(variant, limit=12, source=source)
+            if songs:
+                break
+
     if song_id:
         matched = [s for s in songs if s.song_id == song_id]
         if matched:
             return matched
+    if local:
+        # 曲库结果与在线结果合并去重（曲库优先，可离线播放）。
+        seen = {(x.source, x.song_id) for x in local}
+        songs = local + [x for x in songs if (x.source, x.song_id) not in seen]
     return songs
 
 

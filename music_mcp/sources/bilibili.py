@@ -147,27 +147,51 @@ class BilibiliSource(MusicSource):
             },
         )
 
+    async def _fetch_items(self, query: str) -> list:
+        """按优先级尝试不同检索参数，规避 B 站风控。
+
+        `tids=3 + order=click` 组合检索效果最好，但容易触发风控
+        （响应只含 v_voucher、result 为空）。逐级降级：
+          1. tids=3 + order=click
+          2. tids=3（按默认综合排序）
+          3. order=click
+          4. 无附加参数
+        """
+        variants = (
+            {"tids": "3", "order": "click"},
+            {"tids": "3"},
+            {"order": "click"},
+            {},
+        )
+        last_error = ""
+        for extra in variants:
+            params = {"search_type": "video", "keyword": query, "page": "1"}
+            params.update(extra)
+            try:
+                resp = await self._client.get(_SEARCH_URL, params=params)
+                resp.raise_for_status()
+                data = resp.json()
+            except Exception as exc:
+                last_error = f"B站搜索失败: {exc}"
+                continue
+            if data.get("code") != 0:
+                last_error = f"B站搜索返回异常: {data.get('message')}"
+                continue
+            items = ((data.get("data") or {}).get("result")) or []
+            if items:
+                logger.debug(
+                    "B站检索命中: keyword=%r params=%s items=%d",
+                    query, extra or "none", len(items),
+                )
+                return items
+            # 空结果可能是风控（含 v_voucher），继续降级
+            last_error = "B站返回空结果（疑似风控）"
+        if last_error:
+            logger.warning("B站检索全部降级失败: %s", last_error)
+        return []
+
     async def search(self, query: str, limit: int = 10) -> List[Song]:
-        # tids=3 限定「音乐」分区，order=click 按播放量排序，
-        # 能显著减少 vlog/路透/快闪等无关内容。
-        params = {
-            "search_type": "video",
-            "keyword": query,
-            "page": "1",
-            "tids": "3",
-            "order": "click",
-        }
-        try:
-            resp = await self._client.get(_SEARCH_URL, params=params)
-            resp.raise_for_status()
-            data = resp.json()
-        except Exception as exc:
-            raise SourceError(f"B站搜索失败: {exc}") from exc
-
-        if data.get("code") != 0:
-            raise SourceError(f"B站搜索返回异常: {data.get('message')}")
-
-        items = ((data.get("data") or {}).get("result")) or []
+        items = await self._fetch_items(query)
         songs: List[Song] = []
         for item in items:
             if item.get("type") != "video":

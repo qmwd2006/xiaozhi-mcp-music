@@ -159,19 +159,43 @@ class Library:
         return items[:limit]
 
     def search(self, query: str, limit: int = 20) -> List[dict]:
+        """按关键词搜索曲库，支持同音字容错。
+
+        语音识别常把歌名同音字写错（如「珠玉」-> 「朱玉」），
+        因此匹配时同时比较原文字符与拼音，避免因一个字写错搜不到。
+        """
         q = (query or "").strip().lower()
         with self._lock:
             items = list(self._items.values())
         if not q:
             return self.list(limit)
+
         tokens = [t for t in q.replace("的", " ").split() if t]
+        token_keys = [(t, self._pinyin_key(t)) for t in tokens]
         matched = []
         for item in items:
             haystack = f"{item.get('title','')} {item.get('artist','')}".lower()
-            if all(t in haystack for t in tokens):
+            hay_key = self._pinyin_key(haystack)
+            if all(
+                token in haystack or (key and key in hay_key)
+                for token, key in token_keys
+            ):
                 matched.append(item)
         matched.sort(key=lambda x: x.get("added_at") or 0, reverse=True)
         return matched[:limit]
+
+    @staticmethod
+    def _pinyin_key(text: str) -> str:
+        """把文本转成无分隔的拼音串，用于同音字比较。"""
+        try:
+            from pypinyin import lazy_pinyin
+        except ImportError:
+            return ""
+        cleaned = "".join(ch if ch.isalnum() or "\u4e00" <= ch <= "\u9fff" else " "
+                          for ch in (text or "").lower())
+        if not cleaned.strip():
+            return ""
+        return "".join(lazy_pinyin(cleaned))
 
     def stats(self) -> dict:
         with self._lock:
