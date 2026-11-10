@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import random
 import re
 from typing import Any, Dict, List, Optional
 
@@ -251,6 +252,14 @@ _NOISE_KEYWORDS = (
     "解析", "声乐老师", "乐感课", "对比", "盘点", "混剪", "纯享版",
     "听力", "测试", "挑战", "盲听", "排名", "抄袭", "又双叒叕", "摊上事",
     "热搜", "争议", "回应", "道歉", "爆料", "八卦",
+    "出发", "抵达", "机场", "仁川", "快闪", "偶遇", "街拍", "生图",
+    "当翻唱遇上原唱", "谁更", "歌曲精选", "100首", "大全",
+    "可视化", "原出处", "练唱", "清唱", "幕后", "花絮", "采访",
+    # 话题/解说类标题（避免误伤正常歌名，尽量用短语而非单个常用词）。
+    "是不是把这歌忘了", "这歌忘了", "不让你唱", "玩成游戏", "单曲胶囊",
+    "史上最强", "封神现场", "纯属娱乐", "维密", "倒嗓", "群像",
+    "同人群像", "出道曲", "原著", "出品", "休息室", "无锡站",
+    "首尔", "mashup", "核爆", "献唱",
 )
 
 
@@ -405,21 +414,99 @@ def _candidate_rank(song: Song, tokens: List[str], whole: str, artist_query: str
     return (-relevance, -artist_hit, suspicious, chorus, prio, -song.duration)
 
 
+def _library_item_song(item: dict) -> Song:
+    """把曲库索引项转成 Song（指向本地持久文件）。"""
+    return Song(
+        source="bilibili",
+        source_name="本地曲库",
+        song_id=item.get("bvid", ""),
+        title=item.get("title") or item.get("bvid", ""),
+        artist=item.get("artist") or "",
+        duration=int(item.get("duration") or 0),
+        mime_type="audio/mpeg",
+    )
+
+
+def _looks_like_song_title(title: str) -> bool:
+    """标题是否更像「歌名」而不是视频话题：含书名号《》或总长度较短。"""
+    text = (title or "").strip()
+    if not text:
+        return False
+    if "《" in text and "》" in text:
+        return True
+    # 去掉常见装饰性前缀后仍然很短，通常就是歌名本身。
+    core = re.sub(r"[\[\]【】()（）\s\-—_|]+", "", text)
+    return len(core) <= 24
+
+
+def _random_library_songs(count: int = 1) -> List[Song]:
+    """从本地曲库随机取若干首（用于「播放音乐」这类无歌名指令）。
+
+    分档挑选，尽量避开解说、合集、超长现场：
+    1. 标题非噪声、像歌名且时长合理（90~480 秒）；
+    2. 标题非噪声且时长合理；
+    3. 标题非噪声；
+    4. 所有可播放条目。
+    同一首歌（歌名+歌手归一化后相同）只取一次。
+    """
+    try:
+        items = library.list(limit=200)
+    except Exception as exc:
+        logger.debug("读取曲库失败: %s", exc)
+        return []
+
+    playable = [i for i in items if library.has_file(i.get("bvid", ""))]
+    clean = [i for i in playable if not _is_noisy_title(_library_item_song(i))]
+    well_formed = [
+        i for i in clean
+        if 90 <= int(i.get("duration") or 0) <= 480
+    ]
+    song_like = [i for i in well_formed if _looks_like_song_title(i.get("title", ""))]
+    candidates = song_like or well_formed or clean or playable
+    if not candidates:
+        return []
+
+    random.shuffle(candidates)
+    picked: List[Song] = []
+    seen: set = set()
+    for item in candidates:
+        song = _library_item_song(item)
+        key = (_normalize(song.title), _normalize(song.artist.split("/")[0]))
+        if key in seen:
+            continue
+        seen.add(key)
+        picked.append(song)
+        if len(picked) >= count:
+            break
+    return picked
+
+
 async def _play_song(args: dict) -> dict:
     query = str(args.get("query", "") or "").strip()
     song_id = str(args.get("song_id", "") or "").strip()
     source_raw = str(args.get("source", "auto") or "auto").strip()
     source = source_raw if source_raw in manager.names else None
 
+    picked: Optional[Song] = None
     if not query and not song_id:
-        return _tool_result(
-            ["请提供歌曲名称 query（例如：播放青花瓷），或提供 song_id。"],
-            {"playing": False},
-            is_error=True,
-        )
+        # 「播放音乐」这类没给歌名的指令：从曲库随机挑一首。
+        picks = _random_library_songs(1)
+        if not picks:
+            return _tool_result(
+                ["曲库还是空的。请告诉我歌名（例如：播放青花瓷）。"],
+                {"playing": False},
+                is_error=True,
+            )
+        picked = picks[0]
+        query = picked.title
+        song_id = picked.song_id
+        logger.info("无歌名指令，曲库随机播放: %s", picked.title)
 
     try:
-        candidates = await _resolve_candidates(query, song_id, source)
+        if picked is not None:
+            candidates = [picked]
+        else:
+            candidates = await _resolve_candidates(query, song_id, source)
     except Exception as exc:
         logger.exception("搜索歌曲失败")
         return _tool_result([f"搜索失败: {exc}"], {"playing": False}, is_error=True)
@@ -502,10 +589,37 @@ async def _play_playlist(args: dict) -> dict:
     source = source_raw if source_raw in manager.names else None
 
     if not query:
+        # 「来几首歌」「随便放点」这类无关键词指令：从曲库随机取。
+        picks = _random_library_songs(limit)
+        if not picks:
+            return _tool_result(
+                ["曲库还是空的。请告诉我歌手或歌名，例如：周杰伦。"],
+                {"playing": False, "songs": []},
+                is_error=True,
+            )
+        logger.info("无关键词连播，曲库随机取 %d 首", len(picks))
+        lines = [
+            f"已从曲库随机挑选 {len(picks)} 首：",
+            "请按顺序逐首调用 self.music.enqueue_url，url 参数必须原样复制下面的地址，"
+            "不要改写、不要拼接：",
+        ]
+        for i, s2 in enumerate(picks, 1):
+            lines.append(f"{i}. {s2.title} - {s2.artist}")
+            lines.append(f"   url={stream_server.build_library_url(s2.song_id)}")
+        payload = [
+            {
+                "title": s2.title,
+                "artist": s2.artist,
+                "source": s2.source_name,
+                "duration": s2.duration,
+                "play_url": stream_server.build_library_url(s2.song_id),
+                "mime_type": "audio/mpeg",
+            }
+            for s2 in picks
+        ]
         return _tool_result(
-            ["请提供搜索关键词 query，例如：周杰伦 或 单依纯 的歌。"],
-            {"playing": False, "songs": []},
-            is_error=True,
+            ["\n".join(lines), compact_json({"count": len(payload), "songs": payload})],
+            {"playing": False, "songs": payload},
         )
 
     try:
@@ -583,7 +697,7 @@ async def _play_playlist(args: dict) -> dict:
     # 强调 url 必须原样复制，避免模型自行拼接/臆造地址。
     lines = [
         f"已找到 {len(picked)} 首可播放歌曲。",
-        "请按顺序逐首调用 self.music.play_url，url 参数必须原样复制下面的地址，"
+        "请按顺序逐首调用 self.music.enqueue_url，url 参数必须原样复制下面的地址，"
         "不要改写、不要拼接、不要使用其他域名：",
     ]
     for i, item in enumerate(picked, 1):
@@ -771,12 +885,16 @@ def build_server() -> MCPServer:
         (
             "播放歌曲。用户说“播放xxx”“来一首xxx”“放点xxx”时使用。"
             "传入歌名/歌手后会自动搜索并解析可播放地址；也可传入 search_song 返回的 song_id 和 source 精确播放。"
+            "用户只说“播放音乐”“放首歌”没给歌名时，query 留空，会从本地曲库随机挑一首。"
             "返回内容包含文本信息和 ResourceLink 音频资源（可通过 resource://read_from_http 分页读取后播放）。"
         ),
         {
             "type": "object",
             "properties": {
-                "query": {"type": "string", "description": "歌曲名，或 歌手 + 歌名，例如：青花瓷"},
+                "query": {
+                    "type": "string",
+                    "description": "歌曲名，或 歌手 + 歌名，例如：青花瓷；留空则从曲库随机",
+                },
                 "song_id": {"type": "string", "description": "search_song 返回的歌曲 ID（可选）"},
                 "source": {
                     "type": "string",
@@ -797,7 +915,9 @@ def build_server() -> MCPServer:
         "play_playlist",
         (
             "批量搜索并返回多首歌曲的播放直链，用于连续播放（连播）。"
-            "用户说“播放某歌手的歌”“来几首xx”“播放歌单”时使用。"
+            "用户说“播放某歌手的歌”“来几首xx”“播放歌单”时使用；"
+            "用户说“随便放点”“放点音乐”没给关键词时，query 留空，"
+            "会从本地曲库随机挑歌。"
             "返回结果含 songs 数组，每项有 play_url；"
             "请按顺序逐首调用设备工具 self.music.enqueue_url 加入播放队列"
             "（不要用 self.music.play_url，那是立即播放并清空队列）。"
@@ -805,7 +925,10 @@ def build_server() -> MCPServer:
         {
             "type": "object",
             "properties": {
-                "query": {"type": "string", "description": "歌手名、歌名或关键词，例如：单依纯"},
+                "query": {
+                    "type": "string",
+                    "description": "歌手名、歌名或关键词，例如：单依纯；留空则从曲库随机",
+                },
                 "limit": {
                     "type": "integer",
                     "minimum": 1,
@@ -818,7 +941,6 @@ def build_server() -> MCPServer:
                     "description": "指定音源；auto 表示自动选择",
                 },
             },
-            "required": ["query"],
         },
         _play_playlist,
     )

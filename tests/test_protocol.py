@@ -60,10 +60,15 @@ async def test_search_song_missing_query(server, harness_factory):
 
 
 @pytest.mark.asyncio
-async def test_play_song_missing_args(server, harness_factory):
+async def test_play_song_missing_args_empty_library(server, harness_factory, monkeypatch):
+    # 无歌名时从曲库随机挑一首；曲库为空才报错。
+    from music_mcp import app as app_module
+
+    monkeypatch.setattr(app_module, "_random_library_songs", lambda count=1: [])
     harness = harness_factory(server)
     resp = await harness.request("tools/call", {"name": "play_song", "arguments": {}})
     assert resp["result"]["isError"] is True
+    assert "曲库" in resp["result"]["content"][0]["text"]
 
 
 @pytest.mark.asyncio

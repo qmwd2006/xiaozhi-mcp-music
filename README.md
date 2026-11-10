@@ -15,7 +15,7 @@ AI 可以自主在多个免费音源中搜索歌曲、解析真实播放地址�
 - 🔌 **标准 MCP**：stdio 传输，可接入官方 `mcp_pipe.py` 桥接，也可被任意 MCP 客户端使用
 - 🖥️ **本地播放可选**：配置 `LOCAL_PLAYER=mpv|vlc` 后可在电脑本地播放
 - 🔒 **安全**：令牌仅存于本地 `.env`（已 gitignore），日志不会输出令牌
-- 🧪 **可测试**：16 项离线测试 + 真实音源冒烟脚本，CI 自动运行
+- 🧪 **可测试**：22 项离线测试 + 真实音源冒烟脚本，CI 自动运行
 
 ## 架构
 
@@ -28,7 +28,7 @@ AI 可以自主在多个免费音源中搜索歌曲、解析真实播放地址�
         ▼
    music_mcp  (python -m music_mcp)
         │
-        ├─ 工具: search_song / play_song / get_play_url / list_sources / local_player_control
+        ├─ 工具: search_song / play_song / play_playlist / get_play_url / library_* / list_sources / local_player_control
         ├─ 资源: resource://read_from_http
         │        └─ HTTP Range 分页读取远程音频（Base64 Blob + [DONE]）
         └─ 音源适配器: kuwo / netease / migu / kugou
@@ -105,7 +105,8 @@ $env:SMOKE_QUERY="青花瓷"; python scripts/mcp_smoke.py   # 协议冒烟测试
 | 工具 | 说明 | 主要参数 |
 |---|---|---|
 | `search_song` | 在全部/指定音源搜索歌曲 | `query`（歌名/歌手）、`source`、`limit` |
-| `play_song` | 搜索并播放；返回文本 + ResourceLink 音频资源 | `query`、`song_id`、`source` |
+| `play_song` | 搜索并播放；返回文本 + ResourceLink 音频资源。`query` 留空则从曲库随机挑一首 | `query`、`song_id`、`source` |
+| `play_playlist` | 返回多首歌曲直链用于连播。`query` 留空则从曲库随机挑歌 | `query`、`limit`、`source` |
 | `get_play_url` | 只解析播放直链，不播放 | `query`、`song_id`、`source` |
 | `library_list` | 列出本地曲库已保存歌曲 | `limit` |
 | `library_search` | 在本地曲库搜索（离线可用） | `query` |
@@ -185,10 +186,13 @@ B 站音频转码后会**持久保存**到 `LIBRARY_DIR`（默认 `./library`）
 │   ├── local_player.py        # 可选本地播放器
 │   └── sources/               # 音源适配器（kuwo/netease/migu/kugou）
 ├── scripts/                   # 自检与冒烟测试脚本
-├── tests/                     # 离线单元/集成测试（16 项）
+├── tests/                     # 离线单元/集成测试（22 项）
 ├── mcp_pipe.py                # 官方桥接（WebSocket <-> stdio）
 ├── bridge.py                  # 一键启动桥接
 ├── mcp_config.example.json    # 桥接配置模板
+├── Dockerfile                 # 容器镜像（含 ffmpeg）
+├── docker-compose.yml         # 容器编排（armbian/群晖等）
+├── mcp_config.docker.json     # 容器内桥接配置
 ├── setup.bat / run.bat        # Windows 安装/运行脚本
 ├── start_bridge_hidden.ps1    # 后台隐藏启动
 ├── enable_autostart.ps1/.bat  # 开机自启
@@ -205,6 +209,66 @@ python -m pytest tests -q
 ```
 
 CI（GitHub Actions）会在每次 push/PR 时自动运行全部测试。
+
+## Docker 部署与更新
+
+适用于 armbian、群晖、树莓派等长期在线的主机。镜像已内置 `ffmpeg`，
+并同时支持 `linux/amd64` 与 `linux/arm64`。
+
+### 首次部署
+
+```bash
+# 1) 准备目录与配置（.env 至少包含 MCP_ENDPOINT）
+mkdir -p cache library logs
+cp .env.example .env    # 或使用你自己的 .env
+# 编辑 .env：填写 MCP_ENDPOINT，并设置设备可访问的流地址
+#   STREAM_PUBLIC_HOST=192.168.31.178
+
+# 2) 拉取 CI 构建的镜像并启动
+docker compose pull
+docker compose up -d
+docker compose logs -f --tail=100
+```
+
+看到 `Successfully connected to WebSocket server` 与
+`音频流服务已启动` 即成功。
+
+> 同一 `MCP_ENDPOINT`（token）同时只能有一个桥接在线。切换机器前请先停掉旧实例。
+
+### 更新
+
+```bash
+./scripts/update.sh                 # 跟随 latest
+./scripts/update.sh sha-abc1234     # 固定到某次提交（推荐生产）
+./scripts/update.sh v0.2.0          # 固定到版本 tag
+```
+
+`library/`、`cache/` 为 bind mount，更新镜像不会丢失曲库。
+建议在 `.env` 固定 `MUSIC_MCP_TAG`，避免意外跟随 `latest`。
+
+### 回滚
+
+```bash
+./scripts/rollback.sh sha-abc1234   # 回到之前的镜像
+```
+
+### 本地构建兜底
+
+CI/GHCR 不可用时，可在目标主机直接构建（默认走国内镜像源）：
+
+```bash
+./scripts/build-local.sh
+# 或自定义源：
+PYTHON_IMAGE=python:3.12-slim APT_MIRROR=deb.debian.org \
+PIP_INDEX_URL=https://pypi.org/simple ./scripts/build-local.sh
+```
+
+### 镜像构建流程
+
+`.github/workflows/docker.yml` 在 push 到 `main`、打 `v*` tag、手动触发以及
+每周定时重建时，构建多架构镜像并推送到
+`ghcr.io/<owner>/xiaozhi-mcp-music`，标签包括 `latest`、`sha-<short>` 与版本号。
+首次推送后需将 GHCR package 设为 public，目标主机才能免登录拉取。
 
 ## 常见问题
 

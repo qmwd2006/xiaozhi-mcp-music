@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "xiaozhi-music": {
+      "type": "stdio",
+      "command": "python3",
+      "args": ["-m", "music_mcp"],
+      "env": {
+        "MUSIC_SOURCES": "bilibili",
+        "LOG_LEVEL": "INFO"
+      }
+    }
+  }
+}

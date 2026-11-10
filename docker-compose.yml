@@ -1,0 +1,59 @@
+# 小智音乐 MCP —— Docker Compose 部署
+#
+# 日常更新（推荐）：
+#   ./scripts/update.sh            # 拉取 latest
+#   ./scripts/update.sh sha-abc1234
+#
+# 本地构建兜底：
+#   ./scripts/build-local.sh
+#
+# 数据目录（曲库/缓存）通过 bind mount 持久化，更新镜像不会丢失。
+
+services:
+  xiaozhi-music:
+    image: ghcr.io/qmwd2006/xiaozhi-mcp-music:${MUSIC_MCP_TAG:-latest}
+    build:
+      context: .
+      args:
+        # 国内构建默认走镜像站；CI 构建使用官方源
+        PYTHON_IMAGE: ${PYTHON_IMAGE:-docker.1panel.live/library/python:3.12-slim}
+        APT_MIRROR: ${APT_MIRROR:-mirrors.tuna.tsinghua.edu.cn}
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}
+    container_name: xiaozhi-music-mcp
+    restart: unless-stopped
+    init: true
+    stop_grace_period: 10s
+    env_file:
+      - .env
+    environment:
+      # 容器内没有 .venv，必须使用 docker 专用配置
+      MCP_CONFIG: /app/mcp_config.docker.json
+      # 容器内探测到的是 172.x，必须显式指定设备可访问的局域网地址
+      STREAM_PUBLIC_HOST: ${STREAM_PUBLIC_HOST:-192.168.31.178}
+      STREAM_PORT: "8099"
+      CACHE_DIR: /data/cache
+      LIBRARY_DIR: /data/library
+      LOG_LEVEL: ${MUSIC_LOG_LEVEL:-INFO}
+      TZ: Asia/Shanghai
+    ports:
+      - "8099:8099"
+    volumes:
+      - ./library:/data/library
+      - ./cache:/data/cache
+      - ./logs:/app/logs
+    mem_limit: 768m
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    healthcheck:
+      test:
+        - CMD
+        - python3
+        - -c
+        - "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8099/health', timeout=3).status == 200 else 1)"
+      interval: 30s
+      timeout: 5s
+      start_period: 15s
+      retries: 3

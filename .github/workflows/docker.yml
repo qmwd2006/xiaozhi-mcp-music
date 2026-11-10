@@ -1,0 +1,70 @@
+name: Docker image
+
+# 构建多架构镜像并推送到 GHCR，供 armbian 等设备 docker compose pull 更新。
+# 首次推送后需把 package 设为 public：
+#   gh api --method PATCH /user/packages/container/xiaozhi-mcp-music/visibility \
+#     -f visibility=public
+
+on:
+  push:
+    branches: [main, master]
+    tags: ["v*"]
+  workflow_dispatch:
+  # 每周重建一次，跟进基础镜像与 ffmpeg 的安全更新
+  schedule:
+    - cron: "0 3 * * 1"
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: docker-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=tag
+            type=semver,pattern={{version}}
+            type=sha,prefix=sha-,format=short
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # CI 使用官方源，避免依赖第三方镜像站
+          build-args: |
+            PYTHON_IMAGE=python:3.12-slim
+            APT_MIRROR=deb.debian.org
+            PIP_INDEX_URL=https://pypi.org/simple
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
