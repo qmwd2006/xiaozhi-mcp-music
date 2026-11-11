@@ -114,6 +114,41 @@ class Library:
         with self._lock:
             return self._items.get(bvid)
 
+    def all_items(self) -> List[dict]:
+        """返回全部条目的副本（整理脚本用）。"""
+        with self._lock:
+            return [dict(item) for item in self._items.values()]
+
+    def update_meta(
+        self,
+        bvid: str,
+        *,
+        title: Optional[str] = None,
+        artist: Optional[str] = None,
+        extra: Optional[dict] = None,
+    ) -> bool:
+        """就地更新元数据（不改音频文件），返回是否有变化。"""
+        with self._lock:
+            item = self._items.get(bvid)
+            if not item:
+                return False
+            changed = False
+            if title is not None and title != item.get("title"):
+                item["title"] = title
+                changed = True
+            if artist is not None and artist != item.get("artist"):
+                item["artist"] = artist
+                changed = True
+            if extra:
+                for key, value in extra.items():
+                    if item.get(key) != value:
+                        item[key] = value
+                        changed = True
+            if changed:
+                item["updated_at"] = int(time.time())
+                self._save()
+            return changed
+
     def mark_played(self, bvid: str) -> None:
         with self._lock:
             item = self._items.get(bvid)

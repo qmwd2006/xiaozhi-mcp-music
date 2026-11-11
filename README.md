@@ -270,6 +270,58 @@ PIP_INDEX_URL=https://pypi.org/simple ./scripts/build-local.sh
 `ghcr.io/<owner>/xiaozhi-mcp-music`，标签包括 `latest`、`sha-<short>` 与版本号。
 首次推送后需将 GHCR package 设为 public，目标主机才能免登录拉取。
 
+## 曲库收集与整理
+
+除语音点歌外，可以在部署主机上批量收集某位歌手的单曲并整理曲库。
+两个脚本都复用现有规则（无 LLM 依赖），建议在容器内运行以使用内置 ffmpeg：
+
+```bash
+# 预览将收集哪些歌（不下载）
+docker exec -w /app -e PYTHONPATH=/app xiaozhi-music-mcp \
+  python3 scripts/collect_artist.py 李健 --dry-run
+
+# 实际收集（默认限速 4s/次，风控严时调大）
+docker exec -w /app -e PYTHONPATH=/app xiaozhi-music-mcp \
+  python3 scripts/collect_artist.py 李健 --sleep 6 --limit 20
+```
+
+常用参数：
+
+| 参数 | 说明 |
+|---|---|
+| `--dry-run` | 只列候选，不下载 |
+| `--limit N` | 最多收集 N 首 |
+| `--queries "a,b"` | 自定义搜索关键词（逗号分隔） |
+| `--sleep N` | 搜索间隔基数（秒），默认 4 |
+| `--include bvid,...` | 只收集指定视频 |
+| `--exclude bvid,...` | 跳过指定视频 |
+| `--min-duration / --max-duration` | 时长范围（秒），默认 90–480 |
+
+单个已知视频（官方 MV、现场版等）可直接指定入库：
+
+```bash
+docker exec -w /app -e PYTHONPATH=/app xiaozhi-music-mcp \
+  python3 scripts/add_song.py BV1wJ411y7mc --title 一念一生 --artist 李健
+```
+
+整理曲库（标题/歌手规范化、识别噪声与重复）默认只预览：
+
+```bash
+docker exec -w /app -e PYTHONPATH=/app xiaozhi-music-mcp \
+  python3 scripts/organize_library.py
+
+# 写回元数据（自动备份 index.json）
+docker exec -w /app -e PYTHONPATH=/app xiaozhi-music-mcp \
+  python3 scripts/organize_library.py --apply
+
+# 同时删除噪声/重复（谨慎）
+docker exec -w /app -e PYTHONPATH=/app xiaozhi-music-mcp \
+  python3 scripts/organize_library.py --apply --drop-noise --drop-duplicates
+```
+
+噪声词表可自定义：复制 `noise_words.example.txt` 为 `noise_words.txt`
+（或设置 `NOISE_WORDS_FILE`），每行一个词，会与内置词表合并。
+
 ## 常见问题
 
 **搜索有结果但播放失败**

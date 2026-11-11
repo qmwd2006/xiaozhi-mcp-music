@@ -20,115 +20,27 @@ import argparse
 import asyncio
 import logging
 import random
-import re
 import sys
-import unicodedata
 from typing import Dict, Iterable, List, Optional
 
 from music_mcp import stream_server
 from music_mcp.library import library
-from music_mcp.sources.bilibili import (
-    BilibiliSource,
-    _NON_SONG_KEYWORDS,
-    _extract_artist_from_title,
-    _strip_tags,
-)
+from music_mcp.noise import is_noise, normalize, song_name
+from music_mcp.sources.bilibili import BilibiliSource
 
 logger = logging.getLogger("collect_artist")
-
-# 明显不是「本人单曲」的标题关键词（叠加在音源自带过滤之上）。
-_EXTRA_NOISE = (
-    "盘点", "排名", "排行", "翻唱PK", "PK", "对比", "混剪", "合集", "精选",
-    "循环", "歌单", "串烧", "教学", "教程", "解析", "reaction", "反应",
-    "采访", "综艺", "八卦", "爆料", "争议", "抄袭", "道歉", "回应",
-    "清唱", "练唱", "伴奏", "纯音乐", "钢琴", "吉他", "戏腔", "舞蹈",
-    "练习室", "直拍", "饭拍", "路透", "机场", "出发", "抵达", "街拍",
-    "原唱", "谁是", "谁更", "能否", "变声", "模仿", "分集", "带歌词",
-    "合唱版", "群星", "跨年", "晚会", "音乐节", "巡演", "演唱会",
-    "首唱", "现场版", "live版", "混音", "remix", "dj", "DJ",
-    # 话题/吐槽/榜单类
-    "吐槽", "啥东西", "能听", "有多难唱", "难唱", "好好听", "半夜爬起来",
-    "耳麦", "甜歌", "臻品", "母带", "音质", "完整", "无损", "hi-res",
-    # 画质/活动/剧集等非歌名内容
-    "1080p", "光流", "60帧", "4k", "8k", "mv", "官方", "好奇夜", "晚会",
-    "盛典", "跨年", "第二季", "第一季", "主题曲", "插曲", "片尾曲", "片头曲",
-    # 周深等歌手的常见非单曲标题（游戏/节目/整活/合集）
-    "生草", "小课堂", "九语", "男版", "女版", "崩坏", "蒙面歌王", "歌手当打",
-    "我们的歌", "声入人心", "开场", "串场", "花絮", "幕后", "专访", "连线",
-    "祝福", "公益", "广告", "宣传片", "预告", "片花", "综艺", "舞台合集",
-    "献礼", "致敬", "纪录片", "春晚", "元宵", "中秋", "国庆", "跨年晚会",
-)
 
 # 单曲时长范围（秒）：太短是切片，太长是合集/直播。
 _MIN_DURATION = 90
 _MAX_DURATION = 480
 
-_BOOK_TITLE = re.compile(r"《([^》]{1,40})》")
-
-
-def _norm(text: str) -> str:
-    """归一化：全角转半角、小写、去掉标点/空白，仅保留字母数字汉字。"""
-    text = unicodedata.normalize("NFKC", text or "").lower()
-    return re.sub(r"[^0-9a-z\u4e00-\u9fff]+", "", text)
-
-
-_BLOCK = re.compile(r"[【\[]([^】\]]{2,20})[】\]]")
-
-
-def _song_name(title: str, artist_hint: str = "") -> str:
-    """从标题里提取歌名：优先书名号，其次短方括号块，最后清理后的短标题。"""
-    title = _strip_tags(title)
-    m = _BOOK_TITLE.search(title)
-    if m:
-        name = re.sub(r"\s+", " ", m.group(1)).strip()
-        if _is_noise(name) or (artist_hint and _norm(name) == _norm(artist_hint)):
-            return ""
-        return name
-    # 「【爱错】 王力宏&单依纯 ...」这类：取非噪声的短方括号内容。
-    for block in _BLOCK.findall(title):
-        candidate = block.strip()
-        if len(_norm(candidate)) < 2 or _is_noise(candidate):
-            continue
-        # 「【单依纯】永不失联的爱」这类块只是歌手名，跳过。
-        if _norm(candidate) == _norm(artist_hint):
-            continue
-        return candidate
-    # 去掉【】[]()（）块与常见后缀
-    text = re.sub(r"[【\[][^】\]]*[】\]]", " ", title)
-    text = re.sub(r"[（(][^）)]*[）)]", " ", text)
-    # 「下雨天_单依纯」「如果爱忘了 汪苏泷/单依纯」「有我×周深」：
-    # 去掉结尾的连接符 + 歌手名及其前面的合作者列表。
-    if artist_hint:
-        text = re.sub(
-            rf"[\s_\-—|·×&/、]*{re.escape(artist_hint)}\s*$", " ", text
-        )
-    text = re.sub(r"[-—_|·]+", " ", text)
-    text = re.sub(r"\bbgm\b", " ", text, flags=re.I)
-    text = re.sub(r"\s+", " ", text).strip()
-    # 「李健」「李健 - 向往 MV」这类：去掉歌手名后剩余才是歌名
-    if artist_hint:
-        text = re.sub(rf"^{re.escape(artist_hint)}\s*[-—–|·]?\s*", "", text).strip()
-    # 只剩歌手自己、或含画质/MV 等修饰，视为无效歌名
-    if artist_hint and _norm(text) == _norm(artist_hint):
-        return ""
-    if re.search(r"(\d{3,4}p|mv\b|光流|帧|官方|高清|高清版)", text, re.I):
-        return ""
-    return text
-
-
-def _is_noise(title: str) -> bool:
-    low = (title or "").lower()
-    return any(k.lower() in low for k in _NON_SONG_KEYWORDS) or any(
-        k.lower() in low for k in _EXTRA_NOISE
-    )
-
 
 def _belongs_to_artist(title: str, artist_field: str, artist: str) -> bool:
     """判断这首歌是否由该歌手演唱（独唱或合作均可）。"""
-    key = _norm(artist)
+    key = normalize(artist)
     if not key:
         return False
-    return key in _norm(artist_field) or key in _norm(title)
+    return key in normalize(artist_field) or key in normalize(title)
 
 
 def _iter_queries(artist: str, extra: Optional[str]) -> List[str]:
@@ -182,19 +94,37 @@ async def _search_all(artist: str, queries: Iterable[str], per_query: int) -> Li
     return songs
 
 
-def _select_unique(songs: List, artist: str) -> Dict[str, object]:
-    """过滤并去重，返回 {归一化歌名: Song}，优先保留时长合理的版本。"""
+def _select_unique(
+    songs: List,
+    artist: str,
+    *,
+    include: Optional[set] = None,
+    exclude: Optional[set] = None,
+    min_duration: int = _MIN_DURATION,
+    max_duration: int = _MAX_DURATION,
+) -> Dict[str, object]:
+    """过滤并去重，返回 {归一化歌名: Song}，优先保留时长合理的版本。
+
+    include 非空时只保留这些 bvid；exclude 中的 bvid 一律跳过。
+    """
     picked: Dict[str, object] = {}
+    explicit = include is not None  # 显式指定 bvid 时跳过启发式过滤
     for song in songs:
         title = song.title or ""
-        if not (_MIN_DURATION <= int(song.duration or 0) <= _MAX_DURATION):
+        bvid = song.song_id or ""
+        if exclude and bvid in exclude:
             continue
-        if _is_noise(title):
+        if include and bvid not in include:
             continue
-        if not _belongs_to_artist(title, song.artist or "", artist):
-            continue
-        name = _song_name(title, artist)
-        key = _norm(name)
+        if not explicit:
+            if not (min_duration <= int(song.duration or 0) <= max_duration):
+                continue
+            if is_noise(title):
+                continue
+            if not _belongs_to_artist(title, song.artist or "", artist):
+                continue
+        name = song_name(title, artist)
+        key = normalize(name)
         if not key or len(key) < 2:
             continue
         if len(key) > 20:  # 过长基本是话题/合集标题
@@ -204,11 +134,32 @@ def _select_unique(songs: List, artist: str) -> Dict[str, object]:
             picked[key] = song
             continue
         # 同一首歌多个投稿：优先「歌手字段精确」的，其次时长更接近完整单曲。
-        prev_exact = _norm(prev.artist or "") == _norm(artist)
-        cur_exact = _norm(song.artist or "") == _norm(artist)
+        prev_exact = normalize(prev.artist or "") == normalize(artist)
+        cur_exact = normalize(song.artist or "") == normalize(artist)
         if cur_exact and not prev_exact:
             picked[key] = song
     return picked
+
+
+async def _fetch_by_bvids(bvids: Iterable[str]) -> List:
+    """按 bvid 直接取元数据（不依赖搜索结果）。"""
+    songs = []
+    for bvid in bvids:
+        src = BilibiliSource()
+        try:
+            song = await src.get_song(bvid)
+        except Exception as exc:
+            logger.warning("获取视频信息失败 %s: %s", bvid, exc)
+            song = None
+        finally:
+            await src._client.aclose()
+        if song:
+            songs.append(song)
+            logger.info("指定视频 %s -> %s | %s", bvid, song.title[:40], song.artist)
+        else:
+            logger.warning("指定视频不可用，已跳过: %s", bvid)
+        await asyncio.sleep(1.0)
+    return songs
 
 
 async def _collect_one(song, artist: str) -> bool:
@@ -221,7 +172,7 @@ async def _collect_one(song, artist: str) -> bool:
     finally:
         await src._client.aclose()
 
-    name = _song_name(song.title, artist)
+    name = song_name(song.title, artist)
     try:
         await stream_server._transcode_and_store(
             song.song_id,
@@ -245,7 +196,16 @@ async def main() -> int:
     parser.add_argument("--queries", default=None, help="自定义搜索关键词，逗号分隔")
     parser.add_argument("--dry-run", action="store_true", help="只列出结果，不下载")
     parser.add_argument("--sleep", type=float, default=4.0, help="搜索间隔基数（秒），风控严时调大")
+    parser.add_argument("--include", default="", help="只收集这些 bvid（逗号分隔）")
+    parser.add_argument("--exclude", default="", help="跳过这些 bvid（逗号分隔）")
+    parser.add_argument("--min-duration", type=int, default=_MIN_DURATION,
+                        help=f"最短时长秒，默认 {_MIN_DURATION}")
+    parser.add_argument("--max-duration", type=int, default=_MAX_DURATION,
+                        help=f"最长时长秒，默认 {_MAX_DURATION}")
     args = parser.parse_args()
+
+    include = {b.strip() for b in args.include.split(",") if b.strip()} or None
+    exclude = {b.strip() for b in args.exclude.split(",") if b.strip()} or None
 
     logging.basicConfig(
         level=logging.INFO,
@@ -255,11 +215,22 @@ async def main() -> int:
     global _QUERY_SLEEP
     _QUERY_SLEEP = max(1.0, args.sleep)
     queries = _iter_queries(args.artist, args.queries)
-    songs = await _search_all(args.artist, queries, args.per_query)
-    unique = _select_unique(songs, args.artist)
+    if include:
+        # 指定视频时不走搜索：直接取元数据，避免搜索风控导致漏掉。
+        songs = await _fetch_by_bvids(sorted(include))
+    else:
+        songs = await _search_all(args.artist, queries, args.per_query)
+    unique = _select_unique(
+        songs,
+        args.artist,
+        include=include,
+        exclude=exclude,
+        min_duration=max(1, args.min_duration),
+        max_duration=max(args.min_duration, args.max_duration),
+    )
 
     # 曲库里已有同名歌曲则跳过（不同 bvid 的重复投稿）。
-    existing = {_norm(_song_name(it.get("title", ""), args.artist)) for it in library.list(limit=500)}
+    existing = {normalize(song_name(it.get("title", ""), args.artist)) for it in library.list(limit=500)}
     todo = []
     for key, song in unique.items():
         if key in existing:
@@ -267,8 +238,8 @@ async def main() -> int:
         todo.append(song)
 
     print(f"候选去重后 {len(unique)} 首，曲库已有 {len(unique) - len(todo)} 首，待收集 {len(todo)} 首")
-    for song in sorted(todo, key=lambda s: _song_name(s.title, args.artist)):
-        print(f"  {song.song_id}  {int(song.duration):>4}s  {_song_name(song.title, args.artist)}")
+    for song in sorted(todo, key=lambda s: song_name(s.title, args.artist)):
+        print(f"  {song.song_id}  {int(song.duration):>4}s  {song_name(song.title, args.artist)}")
 
     if args.dry_run:
         return 0

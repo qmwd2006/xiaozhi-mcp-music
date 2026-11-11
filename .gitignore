@@ -18,3 +18,6 @@ outputs/
 library/
 .env.*
 !.env.example
+
+# 用户自定义噪声词表
+noise_words.txt

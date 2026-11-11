@@ -243,6 +243,41 @@ class BilibiliSource(MusicSource):
         cid = v.get("cid")
         return int(cid) if cid else None
 
+    async def get_song(self, bvid: str) -> Optional[Song]:
+        """直接按 bvid 取歌曲元数据（不依赖搜索结果）。
+
+        用于 `--include` 指定视频、或搜索接口被风控时补录已知视频。
+        """
+        try:
+            resp = await self._client.get(_VIEW_URL, params={"bvid": bvid})
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception as exc:
+            logger.warning("B站获取视频信息失败 %s: %s", bvid, exc)
+            return None
+        if data.get("code") != 0:
+            logger.warning("B站视频不可用 %s: %s", bvid, data.get("message"))
+            return None
+        v = data.get("data") or {}
+        title = _strip_tags(str(v.get("title") or ""))
+        if not title:
+            return None
+        duration = int(v.get("duration") or 0)
+        author = _strip_tags(str((v.get("owner") or {}).get("name") or ""))
+        artist = _extract_artist_from_title(title) or clean_text(author) or "未知"
+        return Song(
+            source=self.name,
+            source_name=self.display_name,
+            song_id=bvid,
+            title=clean_text(title),
+            artist=clean_text(artist),
+            album="",
+            duration=duration,
+            cover_url=str(v.get("pic") or "").replace("http://", "https://"),
+            mime_type="audio/mpeg",
+            extra={"uploader": clean_text(author)},
+        )
+
     async def get_audio_source_url(self, bvid: str) -> str:
         """取 DASH 音频直链（fMP4/AAC），供 ffmpeg 转码使用。"""
         cid = await self._get_cid(bvid)
