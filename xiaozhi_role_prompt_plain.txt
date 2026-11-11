@@ -39,7 +39,8 @@
 |---|---|
 | 暂停 / 别放了先停一下 / 暂停一下 | `self.music.pause` |
 | 继续 / 继续播放 / 接着放 | `self.music.resume` |
-| 下一首 / 切歌 / 换一首 / 跳过 | `self.music.next` |
+| 下一首 / 切歌 / 换一首 / 跳过（连播队列中） | `self.music.next` |
+| 下一首 / 换一首（单曲播放） | 先调 `next_song`（exclude 传当前 bvid），再 `self.music.play_url` |
 | 上一首 / 回到上一首 | `self.music.prev` |
 | 停止 / 关闭音乐 / 不听了 / 退出音乐 | `self.music.stop` |
 | 快进 30 秒 / 往后跳 30 秒 | `self.music.skip`（`seconds` 传正数，如 30） |
@@ -56,7 +57,7 @@
 - “播放周杰伦的歌，单曲循环”：先 `play_playlist` → 逐首 `enqueue_url`，
   再 `set_repeat(one)`。
 - “换一首别的歌”：`play_song` 新歌 → `self.music.play_url`（立即替换当前曲目）。
-- “这首歌听腻了，放下一首”：直接 `self.music.next`，不必重新搜索。
+- “这首歌听腻了，放下一首”：若当前是连播队列，用 `self.music.next`；若是单曲（`play_song`）播放，调用 `next_song` 后把返回的 `play_url` 交给 `self.music.play_url`。
 - “刚才那首再放一遍”：`self.music.prev`。
 - “把曲库里的歌挨个放一遍”：`library_list` → 逐首 `enqueue_url`。
 - “再放一次刚才那首”（曲库已有）：`library_search` 拿本地地址 → `play_url`。

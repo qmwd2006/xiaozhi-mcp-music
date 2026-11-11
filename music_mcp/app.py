@@ -971,6 +971,43 @@ async def _local_player_control(args: dict) -> dict:
     )
 
 
+async def _random_other_song(args: dict) -> dict:
+    """再随机推一首歌（用于「下一首/换一首」）。
+
+    exclude 传当前曲目 bvid，避免又推同一首。
+    """
+    exclude = str(args.get("exclude", "") or "").strip()
+    try:
+        items = library.list(limit=500)
+    except Exception as exc:
+        return _tool_result([f"读取曲库失败: {exc}"], {"playing": False}, is_error=True)
+
+    candidates = [
+        i for i in items
+        if i.get("bvid") and i.get("bvid") != exclude and library.has_file(i.get("bvid", ""))
+    ]
+    candidates = [
+        i for i in candidates
+        if not _is_noisy_title(_library_item_song(i))
+        and 90 <= int(i.get("duration") or 0) <= 480
+    ]
+    if not candidates:
+        return _tool_result(["曲库里没有其他可播放的歌了。"], {"playing": False}, is_error=True)
+
+    item = random.choice(candidates)
+    song = _library_item_song(item)
+    url = stream_server.build_library_url(song.song_id)
+    logger.info("换一首：%s -> %s", exclude or "(none)", song.title)
+    return _tool_result(
+        [compact_json({"playing": True, "title": song.title, "artist": song.artist,
+                       "source": song.source_name, "play_url": url,
+                       "message": f"换一首：{song.title} - {song.artist}"})],
+        {"playing": True, "title": song.title, "artist": song.artist,
+         "source": song.source_name, "play_url": url},
+        resource_link=_resource_link(song, url, "audio/mpeg"),
+    )
+
+
 def build_server() -> MCPServer:
     server = MCPServer(server_name="xiaozhi-music-mcp", version="0.1.0")
 
@@ -1082,6 +1119,23 @@ def build_server() -> MCPServer:
             },
         },
         _get_play_url,
+    )
+
+    server.add_tool(
+        "next_song",
+        (
+            "换一首：从本地曲库随机挑一首不同于当前曲目的歌并返回播放地址。"
+            "用户说“下一首”“换一首”“不听这个了”且当前是单曲播放时使用。"
+            "参数 exclude 传当前正在播放的 bvid（可从 self.music.status 或上次返回中获得）。"
+            "返回内容含 ResourceLink，可通过 resource://read_from_http 读取。"
+        ),
+        {
+            "type": "object",
+            "properties": {
+                "exclude": {"type": "string", "description": "当前曲目 bvid，避免重复"},
+            },
+        },
+        _random_other_song,
     )
 
     server.add_tool(
