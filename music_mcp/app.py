@@ -481,6 +481,78 @@ def _random_library_songs(count: int = 1) -> List[Song]:
     return picked
 
 
+def _library_songs_by_artist(artist: str, limit: int = 10) -> List[Song]:
+    """从本地曲库取某歌手的歌（用于「播放李健的歌」这类指令）。
+
+    优先返回时长合理、标题干净的单曲；同一歌名只保留一首。
+    曲库命中可离线播放，也避免频繁触发音源风控。
+    """
+    key = _normalize(artist)
+    if len(key) < 2:
+        return []
+    try:
+        items = library.list(limit=500)
+    except Exception as exc:
+        logger.debug("读取曲库失败: %s", exc)
+        return []
+
+    matched: List[dict] = []
+    for item in items:
+        bvid = item.get("bvid") or ""
+        if not bvid or not library.has_file(bvid):
+            continue
+        artist_field = _normalize(item.get("artist") or "")
+        title = item.get("title") or ""
+        # 只认「歌手字段命中」或「标题以『歌手《/【』开头」，
+        # 避免把歌名本身误判成歌手（例如曲库里有一首《青花瓷》）。
+        title_prefix = re.match(rf"^\s*{re.escape(artist)}\s*[《【]", title)
+        if key in artist_field or title_prefix:
+            matched.append(item)
+
+    def _quality(item: dict) -> tuple:
+        duration = int(item.get("duration") or 0)
+        title = item.get("title") or ""
+        return (
+            0 if 90 <= duration <= 480 else 1,
+            0 if _looks_like_song_title(title) else 1,
+            -duration,
+        )
+
+    matched.sort(key=_quality)
+    picked: List[Song] = []
+    seen: set = set()
+    for item in matched:
+        song = _library_item_song(item)
+        if _is_noisy_title(song):
+            continue
+        name_key = _normalize(song.title)
+        if not name_key or name_key in seen:
+            continue
+        seen.add(name_key)
+        picked.append(song)
+        if len(picked) >= limit:
+            break
+    return picked
+
+
+def _query_artist_name(query: str) -> str:
+    """判断查询是否就是「某歌手」（而非具体歌名），返回歌手名或空串。
+
+    仅当查询清洗后只有一个词、且曲库里存在该歌手的歌时才认定为歌手，
+    避免把单字歌名或冷门歌名误判。
+    """
+    text = _search_query(query)
+    tokens, _ = _query_terms(text)
+    if len(tokens) != 1:
+        return ""
+    candidate = tokens[0]
+    if len(candidate) < 2 or len(candidate) > 8:
+        return ""
+    if _library_songs_by_artist(candidate, limit=1):
+        return candidate
+    return ""
+
+
 async def _play_song(args: dict) -> dict:
     query = str(args.get("query", "") or "").strip()
     song_id = str(args.get("song_id", "") or "").strip()
@@ -501,6 +573,18 @@ async def _play_song(args: dict) -> dict:
         query = picked.title
         song_id = picked.song_id
         logger.info("无歌名指令，曲库随机播放: %s", picked.title)
+
+    # 「播放李健」这类纯歌手指令：曲库里有就直接播该歌手的一首，
+    # 既避免音源风控，也能离线播放。
+    if not song_id and query:
+        artist = _query_artist_name(query)
+        if artist:
+            songs = _library_songs_by_artist(artist, limit=1)
+            if songs:
+                picked = songs[0]
+                query = picked.title
+                song_id = picked.song_id
+                logger.info("歌手指令命中曲库: %s -> %s", artist, picked.title)
 
     try:
         if picked is not None:
@@ -621,6 +705,38 @@ async def _play_playlist(args: dict) -> dict:
             ["\n".join(lines), compact_json({"count": len(payload), "songs": payload})],
             {"playing": False, "songs": payload},
         )
+
+    # 「播放李健的歌」这类纯歌手指令：优先用曲库里该歌手的歌，
+    # 避免大量在线搜索触发音源风控，也能离线播放。
+    artist = _query_artist_name(query)
+    if artist:
+        library_songs = _library_songs_by_artist(artist, limit=limit)
+        if library_songs:
+            logger.info("歌手指令命中曲库: %s -> %d 首", artist, len(library_songs))
+            lines = [
+                f"已从曲库挑选 {len(library_songs)} 首 {artist} 的歌：",
+                "请按顺序逐首调用 self.music.enqueue_url，url 参数必须原样复制下面的地址，"
+                "不要改写、不要拼接：",
+            ]
+            payload = []
+            for i, s2 in enumerate(library_songs, 1):
+                url = stream_server.build_library_url(s2.song_id)
+                lines.append(f"{i}. {s2.title} - {s2.artist}")
+                lines.append(f"   url={url}")
+                payload.append(
+                    {
+                        "title": s2.title,
+                        "artist": s2.artist,
+                        "source": s2.source_name,
+                        "duration": s2.duration,
+                        "play_url": url,
+                        "mime_type": "audio/mpeg",
+                    }
+                )
+            return _tool_result(
+                ["\n".join(lines), compact_json({"count": len(payload), "songs": payload})],
+                {"playing": False, "songs": payload},
+            )
 
     try:
         # 连播需要更多候选，扩大搜索量后再筛选。
@@ -886,6 +1002,7 @@ def build_server() -> MCPServer:
             "播放歌曲。用户说“播放xxx”“来一首xxx”“放点xxx”时使用。"
             "传入歌名/歌手后会自动搜索并解析可播放地址；也可传入 search_song 返回的 song_id 和 source 精确播放。"
             "用户只说“播放音乐”“放首歌”没给歌名时，query 留空，会从本地曲库随机挑一首。"
+            "用户只报歌手名（如“播放李健”）时，会优先播放本地曲库里该歌手的歌。"
             "返回内容包含文本信息和 ResourceLink 音频资源（可通过 resource://read_from_http 分页读取后播放）。"
         ),
         {
@@ -917,7 +1034,8 @@ def build_server() -> MCPServer:
             "批量搜索并返回多首歌曲的播放直链，用于连续播放（连播）。"
             "用户说“播放某歌手的歌”“来几首xx”“播放歌单”时使用；"
             "用户说“随便放点”“放点音乐”没给关键词时，query 留空，"
-            "会从本地曲库随机挑歌。"
+            "会从本地曲库随机挑歌；用户只报歌手名（如“播放李健的歌”）时，"
+            "会优先连播曲库里该歌手的歌。"
             "返回结果含 songs 数组，每项有 play_url；"
             "请按顺序逐首调用设备工具 self.music.enqueue_url 加入播放队列"
             "（不要用 self.music.play_url，那是立即播放并清空队列）。"

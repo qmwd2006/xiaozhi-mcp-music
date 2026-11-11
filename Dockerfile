@@ -1,5 +1,3 @@
-# syntax=docker/dockerfile:1
-#
 # 小智音乐 MCP 运行镜像。
 #
 # 默认使用官方 Python 镜像；国内构建可通过 build args 换成镜像站：
