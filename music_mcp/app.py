@@ -16,6 +16,7 @@ from music_mcp.sources import manager
 from music_mcp.utils import compact_json, truncate_text
 from music_mcp import stream_server
 from music_mcp.library import library
+from music_mcp.playlist import playlist
 
 logger = logging.getLogger("music_mcp.app")
 
@@ -1008,6 +1009,147 @@ async def _random_other_song(args: dict) -> dict:
     )
 
 
+async def _playlist_play(args: dict) -> dict:
+    """构建播放列表并一次性下发给设备（self.music.set_queue）。
+
+    规则：
+    - 指定歌曲：先查本地曲库，命中作首曲；否则从网络获取这一首作首曲。
+    - 指定歌手：曲库该歌手多首作基础。
+    - 泛指/无关键词：曲库随机。
+    - 用曲库/在线补足到 limit 首（默认 10），去重；列表总以指定曲开头（若找到）。
+    """
+    query = str(args.get("query", "") or "").strip()
+    limit = int(args.get("limit", 10) or 10)
+    limit = max(1, min(limit, 10))
+    source_raw = str(args.get("source", "auto") or "auto").strip()
+    source = source_raw if source_raw in manager.names else None
+
+    picked: List[Song] = []
+    seen_keys: set = set()
+
+    def _key(song: Song) -> tuple:
+        return (_normalize(song.title), _normalize((song.artist or "").split("/")[0]))
+
+    def _add(song: Song) -> bool:
+        k = _key(song)
+        if k in seen_keys:
+            return False
+        seen_keys.add(k)
+        picked.append(song)
+        return True
+
+    not_found = ""
+    # 1) 指定歌曲（非纯歌手）：本地优先 -> 在线
+    artist = _query_artist_name(query) if query else ""
+    if query and not artist:
+        local = _library_candidates(query, limit=5)
+        chosen = None
+        for song in local:
+            if _normalize(song.title) == _normalize(query) or _normalize(query) in _normalize(song.title):
+                chosen = song
+                break
+        if chosen is None and local:
+            chosen = local[0]
+        if chosen is None:
+            try:
+                cand = await _resolve_candidates(query, "", source)
+                if cand:
+                    # 按匹配度排序，优先取标题/歌手真正命中 query 的候选作为首曲。
+                    tk, wh = _query_terms(query)
+                    cand = sorted(cand, key=lambda x: _candidate_rank(x, tk, wh))
+                    best = cand[0]
+                    if _relevance(best, tk, wh) > 0:
+                        chosen = best
+                    else:
+                        logger.info("在线候选与《%s》匹配度过低，视为未找到", query)
+            except Exception as exc:
+                logger.warning("列表指定歌曲在线获取失败: %s", exc)
+        if chosen is not None:
+            _add(chosen)
+            logger.info("播放列表首曲: %s - %s", chosen.title, chosen.artist)
+        else:
+            not_found = query
+            logger.info("播放列表指定歌曲未找到: %s", query)
+    # 2) 歌手：曲库该歌手多首
+    elif artist:
+        for song in _library_songs_by_artist(artist, limit=limit):
+            _add(song)
+    # 3) 泛指/无关键词：曲库随机
+    if len(picked) < limit:
+        try:
+            for song in _random_library_songs(limit * 2):
+                if len(picked) >= limit:
+                    break
+                _add(song)
+        except Exception as exc:
+            logger.warning("曲库随机补足失败: %s", exc)
+
+    if not picked:
+        return _tool_result(
+            ["曲库为空且未指定可播放歌曲。请看告诉我歌名或歌手。"],
+            {"playing": False, "songs": []},
+            is_error=True,
+        )
+
+    # 解析每首的播放直链
+    items: List[dict] = []
+    for song in picked[:limit]:
+        try:
+            play = await manager.resolve(song)
+            if not play.url:
+                continue
+            items.append({
+                "id": song.song_id,
+                "title": song.title,
+                "artist": song.artist,
+                "url": play.url,
+            })
+        except Exception as exc:
+            logger.warning("播放列表解析失败 %s: %s", song.title, exc)
+            continue
+
+    if not items:
+        return _tool_result(
+            ["歌曲播放地址解析失败，请换一首或稍后再试。"],
+            {"playing": False, "songs": []},
+            is_error=True,
+        )
+
+    playlist.set_items(items, repeat="list")
+    urls_str = "\n".join(i["url"] for i in items)
+
+    head = f"已准备 {len(items)} 首的播放列表。"
+    if not_found:
+        head = f"未找到《{not_found}》，已用其它歌曲组成 {len(items)} 首播放列表。"
+    lines = [
+        head,
+        "请**一次性**调用设备工具 self.music.set_queue，把下面全部地址用换行拼接后原样传入 urls 参数"
+        "（不要逐首 enqueue，不要改写地址）：",
+        urls_str,
+    ]
+    payload = [
+        {"title": i["title"], "artist": i["artist"], "play_url": i["url"], "mime_type": "audio/mpeg"}
+        for i in items
+    ]
+    return _tool_result(
+        ["\n".join(lines), compact_json({"count": len(items), "urls": urls_str, "songs": payload})],
+        {"playing": False, "count": len(items), "urls": urls_str, "songs": payload},
+    )
+
+
+async def _playlist_clear(args: dict) -> dict:
+    playlist.clear()
+    return _tool_result(["已清空服务端播放列表。"], {"cleared": True})
+
+
+async def _playlist_status(args: dict) -> dict:
+    items = playlist.items()
+    lines = [f"服务端播放列表共 {len(items)} 首，模式={playlist.repeat()}："]
+    for i, item in enumerate(items, 1):
+        lines.append(f"{i}. {item.get('title')} - {item.get('artist')}")
+    return _tool_result(["\n".join(lines)], {"count": len(items), "repeat": playlist.repeat(), "items": items})
+
+
 def build_server() -> MCPServer:
     server = MCPServer(server_name="xiaozhi-music-mcp", version="0.1.0")
 
@@ -1249,4 +1391,38 @@ def build_server() -> MCPServer:
             "到达末尾返回 base64 编码的 [DONE]。"
         ),
     )
+
+    server.add_tool(
+        "playlist_play",
+        (
+            "为设备构建播放列表并一次性下发。用户说“播放XX音乐”“来点XX的歌”“放个歌单”“随便放点”时使用。"
+            "指定歌曲时先查本地曲库，找不到再从网络获取这一首作为列表首曲，其余用曲库/在线补足到 limit 首。"
+            "返回里含 urls 字段（多首地址换行拼接）：请一次性调用设备工具 self.music.set_queue，"
+            "把 urls 原样传入，不要逐首 enqueue。列表默认整队循环。"
+        ),
+        {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "歌名、歌手或关键词；留空则从曲库随机取值"},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 10, "description": "列表歌曲数，默认 10"},
+                "source": {"type": "string", "enum": SOURCE_CHOICES, "description": "指定音源，auto 自动"},
+            },
+        },
+        _playlist_play,
+    )
+
+    server.add_tool(
+        "playlist_clear",
+        "清空服务端保存的播放列表。用户说“清空播放列表”“清空歌单”时使用。",
+        {"type": "object", "properties": {}},
+        _playlist_clear,
+    )
+
+    server.add_tool(
+        "playlist_status",
+        "查看服务端保存的播放列表内容与循环模式。用户问“播放列表有什么”“歌单里有哪些”时使用。",
+        {"type": "object", "properties": {}},
+        _playlist_status,
+    )
+
     return server
